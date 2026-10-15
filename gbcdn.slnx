@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="gbcdn.frontend/gbcdn.frontend.csproj" />
+  <Project Path="gbcdn/gbcdn.csproj" />
+</Solution>
