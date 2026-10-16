@@ -9,10 +9,14 @@ namespace GbcDN.Frontend;
 
 internal static class Program
 {
+    private static short[] _audioShorts = [];
+    private static byte[] _audioBytes = [];
+    private static byte[] _audioSilence = [];
+
     [STAThread]
     private static void Main(string[] args)
     {
-        if (!SDL.Init(SDL.InitFlags.Video))
+        if (!SDL.Init(SDL.InitFlags.Video | SDL.InitFlags.Audio))
         {
             SDL.LogError(SDL.LogCategory.System, $"SDL could not initialize: {SDL.GetError()}");
             return;
@@ -44,6 +48,26 @@ internal static class Program
 		var ppu = new Ppu(cpu);
 		var timer = new Timer(cpu);
 		var input = new Input(cpu);
+		var apu = new Apu(cpu, 44100);
+
+		var audioSpec = new SDL.AudioSpec
+		{
+			Channels = 2,
+			Format = SDL.AudioFormat.AudioS16LE,
+			Freq = apu.SampleRate
+		};
+
+		var audioStream = SDL.OpenAudioDeviceStream(SDL.AudioDeviceDefaultPlayback, in audioSpec, null, IntPtr.Zero);
+		if (audioStream == IntPtr.Zero)
+		{
+			SDL.LogError(SDL.LogCategory.Application, $"Couldn't open audio stream: {SDL.GetError()}");
+		}
+		else
+		{
+			PrimeAudioStream(audioStream, apu.SampleRate);
+			SDL.ResumeAudioStreamDevice(audioStream);
+		}
+
 		var totalCycles = 0;
 		var  frameDuration = TimeSpan.FromSeconds(70_224.0 / 4_194_304.0);
 		long nextFrameTimestamp = Stopwatch.GetTimestamp();
@@ -111,6 +135,7 @@ internal static class Program
 			var cycles = cpu.ExecuteSingleStep();
 			timer.ExecuteSingleStep(cycles);
 			ppu.ExecuteSingleStep(cycles);
+			apu.ExecuteSingleStep(cycles);
 			totalCycles += cycles;
 
 			const int dotPerFrame = 70_224;
@@ -129,6 +154,8 @@ internal static class Program
 					// Present the updated backbuffer
 					SDL.RenderPresent(renderer);
 				});
+
+				PumpAudio(audioStream, apu);
 
 				// --- frame throttling ---
 				nextFrameTimestamp += (long)(Stopwatch.Frequency * frameDuration.TotalSeconds);
@@ -179,11 +206,52 @@ internal static class Program
 			}
 		}
 
+        if (audioStream != IntPtr.Zero)
+            SDL.DestroyAudioStream(audioStream);
+
         SDL.DestroyRenderer(renderer);
         SDL.DestroyWindow(window);
         SDL.Quit();
 
     }
+
+    private static int AudioTargetBytes(int sampleRate)
+        => sampleRate * 2 * sizeof(short) / 30; // ~33 ms of S16 stereo
+
+    private static void PrimeAudioStream(IntPtr audioStream, int sampleRate)
+    {
+        var targetBytes = AudioTargetBytes(sampleRate);
+        if (_audioSilence.Length < targetBytes)
+            _audioSilence = new byte[targetBytes];
+        SDL.PutAudioStreamData(audioStream, _audioSilence, targetBytes);
+    }
+
+    private static void PumpAudio(IntPtr audioStream, Apu apu)
+	{
+		var targetBytes = AudioTargetBytes(apu.SampleRate);
+		var queued = SDL.GetAudioStreamQueued(audioStream);
+		var deficitSamples = (targetBytes - queued) / sizeof(short);
+		if (deficitSamples > 0)
+		{
+			if (_audioShorts.Length < deficitSamples)
+			{
+				_audioShorts = new short[deficitSamples];
+				_audioBytes = new byte[deficitSamples * sizeof(short)];
+			}
+
+			var read = apu.Buffer.Read(_audioShorts.AsSpan(0, deficitSamples));
+			if (read > 0)
+			{
+				System.Buffer.BlockCopy(_audioShorts, 0, _audioBytes, 0, read * sizeof(short));
+				SDL.PutAudioStreamData(audioStream, _audioBytes, read * sizeof(short));
+			}
+		}
+
+		// Dynamic rate control: gently adjust playback speed so the emulator and device clocks never drift apart
+		queued = SDL.GetAudioStreamQueued(audioStream);
+		var ratio = 1.0 + ((queued - targetBytes) / (double)targetBytes * 0.005);
+		SDL.SetAudioStreamFrequencyRatio(audioStream, (float)Math.Clamp(ratio, 0.995, 1.005));
+	}
 
     private static void PrintFrameBufferOnTexture(nint framebufferTexture, Ppu gpu, int scale)
 	{
