@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 
 namespace GbcDN;
 
@@ -138,12 +139,16 @@ public sealed class Ppu
 
 	public const int ScreenWidth = 160;
 	public const int ScreenHeight = 144;
-	public readonly byte[,] FrameBuffer = new byte[ScreenWidth, ScreenHeight];
-	public readonly ushort[,] FrameBuffer2 = new ushort[ScreenWidth, ScreenHeight];
+	public readonly ushort[] FrameBuffer2 = new ushort[ScreenWidth * ScreenHeight];
+	GCHandle handleFb;
+	IntPtr ptrFb;
 	private bool _statInterruptLine;
 
 	public Ppu(Cpu cpu)
 	{
+		handleFb = GCHandle.Alloc(FrameBuffer2, GCHandleType.Pinned);
+		ptrFb = handleFb.AddrOfPinnedObject();
+
 		_cpu = cpu;
 		_cpu.OnMemoryWrite[0x41] = value => _cpu.Memory[0xFF41] = (byte)((_cpu.Memory[0xFF41] & 0b1000_0111) | (value & ~0b1000_0111)); // STAT
 		_cpu.OnMemoryWrite[0x46] = value => 
@@ -159,6 +164,12 @@ public sealed class Ppu
 		}; // DMA: OAM DMA source address & start
 		STAT = StatBits.Reserved7;
 		LCDC = LcdcBits.PriorityEnabled | LcdcBits.BackgroundAndWindowTileDataSelect | LcdcBits.LCDEnable;
+	}
+
+	public void Dispose()
+	{
+		if (handleFb.IsAllocated)
+			handleFb.Free();
 	}
 
 	private PpuMode GetMode() => LY < ScreenHeight ? _currentScanLineDots switch
@@ -219,8 +230,6 @@ public sealed class Ppu
 
 		const int oamWidth = 8;
 		const int oam8By16Height = 16;
-		int oamHeight = lcdc.HasFlag(LcdcBits.ObjectSize) ? oam8By16Height : oamWidth;
-		var screenYForOAM = screenY + 16;
 
 		// Max 40 OAM entries; Only 10 can actually be visible on a given scanline.
 		Span<OAMRenderData> visibleOAMsInLine = stackalloc OAMRenderData[40];
@@ -228,6 +237,8 @@ public sealed class Ppu
 
 		if (lcdc.HasFlag(LcdcBits.ObjectEnable))
 		{
+			int oamHeight = lcdc.HasFlag(LcdcBits.ObjectSize) ? oam8By16Height : oamWidth;
+			var screenYForOAM = screenY + 16;
 			var u = OAMAttributesStartAddress;
 			while (u <= OAMAttributesEndAddress)
 			{
@@ -261,51 +272,51 @@ public sealed class Ppu
 			}
 		}
 
-		for (var screenX = 0; screenX < ScreenWidth; screenX++)
+		unsafe
 		{
-			var color = 0;
-			var backgroundAndWindowColorIndex = 0;
-			BGAttributeBits bgwndAttribs = BGAttributeBits.None;
-			
-			backgroundAndWindowColorIndex = GetBackgroundTileMapPixelIndex(backgroundTileIndexBaseAddr, (byte)(SCX + screenX), (byte)(SCY + screenY), out bgwndAttribs);
-			if (lcdc.HasFlag(LcdcBits.WindowEnable))
+			ushort *fbPtr = (ushort*)ptrFb.ToPointer() + screenY * ScreenWidth;
+			for (var screenX = 0; screenX < ScreenWidth; screenX++, fbPtr++)
 			{
-				var x = screenX - (WX - 7);
-				var y = screenY - WY;
-				if (x >= 0 && y >= 0)
-					backgroundAndWindowColorIndex = GetBackgroundTileMapPixelIndex(windowTileIndexBaseAddr, x, y, out bgwndAttribs);
-			}
-			color = ((int)_cpu.CRamBg[((int)bgwndAttribs & 0x7) << 3 | (backgroundAndWindowColorIndex<<1) | 1] << 8) | (((int)_cpu.CRamBg[((int)bgwndAttribs & 0x7) << 3 | (backgroundAndWindowColorIndex<<1)]) << 0);
-
-			if(lcdc.HasFlag(LcdcBits.PriorityEnabled) && bgwndAttribs.HasFlag(BGAttributeBits.Priority) && backgroundAndWindowColorIndex != 0)
-			{
-				FrameBuffer2[screenX, screenY] = (ushort)color;
-				continue;
-			}
-
-			// Render only pre-filtered OAM sprites for this pixel
-			var screenXForOAM = screenX + 8;
-			for (var i = 0; i < visibleOamCount; i++)
-			{
-				ref var oam = ref visibleOAMsInLine[i];
-
-				if (screenXForOAM < oam.X || screenXForOAM >= oam.X + oamWidth || (lcdc.HasFlag(LcdcBits.PriorityEnabled) && oam.HasPriority && backgroundAndWindowColorIndex != 0))
-					continue;
-
-				var oamColorIndex = GetTilePixelColorIndex(oam.TileIndex, oam.XFlip ? oam.X + 7 - screenXForOAM : screenXForOAM - oam.X, oam.TileY, oam.PaletteBank==1);
-
-				if (oamColorIndex != 0)
+				var backgroundAndWindowColorIndex = 0;
+				BGAttributeBits bgwndAttribs = BGAttributeBits.None;
+				
+				if (lcdc.HasFlag(LcdcBits.WindowEnable))
 				{
-					color = ((int)_cpu.CRamObj[(oam.CGBPalette << 3) | (oamColorIndex<<1) | 1] << 8) | ((int)(_cpu.CRamObj[(oam.CGBPalette << 3) | (oamColorIndex<<1)]) << 0);
-					// var red = (color & 0x7C00) >> 10;
-					// var green = (color & 0x03E0) >> 5;
-					// var blue = (color & 0x001F);
+					var x = screenX - (WX - 7);
+					var y = screenY - WY;
+					if (x >= 0 && y >= 0)
+						backgroundAndWindowColorIndex = GetBackgroundTileMapPixelIndex(windowTileIndexBaseAddr, x, y, out bgwndAttribs);
+					else
+						backgroundAndWindowColorIndex = GetBackgroundTileMapPixelIndex(backgroundTileIndexBaseAddr, (byte)(SCX + screenX), (byte)(SCY + screenY), out bgwndAttribs);
+				}
+				else
+					backgroundAndWindowColorIndex = GetBackgroundTileMapPixelIndex(backgroundTileIndexBaseAddr, (byte)(SCX + screenX), (byte)(SCY + screenY), out bgwndAttribs);
+				
+				*fbPtr = (ushort)(((int)_cpu.CRamBg[((int)bgwndAttribs & 0x7) << 3 | (backgroundAndWindowColorIndex<<1) | 1] << 8) | (((int)_cpu.CRamBg[((int)bgwndAttribs & 0x7) << 3 | (backgroundAndWindowColorIndex<<1)]) << 0));
+
+				if(lcdc.HasFlag(LcdcBits.PriorityEnabled) && bgwndAttribs.HasFlag(BGAttributeBits.Priority) && backgroundAndWindowColorIndex != 0)
+				{
+					continue;
 				}
 
-			}
+				// Render only pre-filtered OAM sprites for this pixel
+				var screenXForOAM = screenX + 8;
+				for (var i = 0; i < visibleOamCount; i++)
+				{
+					ref var oam = ref visibleOAMsInLine[i];
 
-			FrameBuffer2[screenX, screenY] = (ushort)color;
+					if (screenXForOAM < oam.X || screenXForOAM >= oam.X + oamWidth || (lcdc.HasFlag(LcdcBits.PriorityEnabled) && oam.HasPriority && backgroundAndWindowColorIndex != 0))
+						continue;
+
+					var oamColorIndex = GetTilePixelColorIndex(oam.TileIndex, oam.XFlip ? oam.X + 7 - screenXForOAM : screenXForOAM - oam.X, oam.TileY, oam.PaletteBank==1);
+					if (oamColorIndex != 0)
+					{
+						*fbPtr = (ushort)(((int)_cpu.CRamObj[(oam.CGBPalette << 3) | (oamColorIndex<<1) | 1] << 8) | ((int)(_cpu.CRamObj[(oam.CGBPalette << 3) | (oamColorIndex<<1)]) << 0));
+					}
+				}
+			}
 		}
+
 	}
 
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -314,8 +325,8 @@ public sealed class Ppu
 		var tilemapX = x >> 3;
 		var tilemapY = y >> 3;
 
-		attribs = (BGAttributeBits)_cpu.VRamUpper[0x1800 + (tilemapY << 5) + tilemapX];
-		var tileIndexAddress = tileIndexBaseAddr + (tilemapY << 5) + tilemapX;
+		attribs = (BGAttributeBits)_cpu.VRamUpper[0x1800 | (tilemapY << 5) | tilemapX];
+		var tileIndexAddress = tileIndexBaseAddr | (tilemapY << 5) | tilemapX;
 		int tileIndex = _cpu.Memory[tileIndexAddress];
 		if (!LCDC.HasFlag(LcdcBits.BackgroundAndWindowTileDataSelect))
 			tileIndex = 256 + (sbyte)tileIndex;

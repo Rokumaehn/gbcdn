@@ -13,6 +13,11 @@ internal static class Program
     private static byte[] _audioBytes = [];
     private static byte[] _audioSilence = [];
 
+	static long _cpuTicks, _timerTicks, _ppuTicks, _apuTicks;
+	static long _sampledCycles;
+	static bool _measureFrame;
+	static int _frameCounter;
+
     [STAThread]
     private static void Main(string[] args)
     {
@@ -44,11 +49,13 @@ internal static class Program
         var romFilename = args.Length > 0 ? args[0] : Path.GetFullPath("../../../../silver.gbc");
 		var rom = File.ReadAllBytes(romFilename);
 
-		var cpu = new Cpu(rom);
+		var cpu = new Cpu(rom, romFilename);
 		var ppu = new Ppu(cpu);
 		var timer = new Timer(cpu);
 		var input = new Input(cpu);
 		var apu = new Apu(cpu, 44100);
+		var rtc = new Rtc(cpu);
+		cpu.Load();
 
 		var audioSpec = new SDL.AudioSpec
 		{
@@ -132,10 +139,31 @@ internal static class Program
 				}
 			}
 
-			var cycles = cpu.ExecuteSingleStep();
-			timer.ExecuteSingleStep(cycles);
-			ppu.ExecuteSingleStep(cycles);
-			apu.ExecuteSingleStep(cycles);
+			int cycles;
+			if (_measureFrame)
+			{
+				var t0 = Stopwatch.GetTimestamp();
+				cycles = cpu.ExecuteSingleStep();
+				var t1 = Stopwatch.GetTimestamp();
+				timer.ExecuteSingleStep(cycles);
+				var t2 = Stopwatch.GetTimestamp();
+				ppu.ExecuteSingleStep(cycles);
+				var t3 = Stopwatch.GetTimestamp();
+				apu.ExecuteSingleStep(cycles);
+				var t4 = Stopwatch.GetTimestamp();
+				_cpuTicks += t1 - t0;
+				_timerTicks += t2 - t1;
+				_ppuTicks += t3 - t2;
+				_apuTicks += t4 - t3;
+				_sampledCycles += cycles;
+			}
+			else
+			{
+				cycles = cpu.ExecuteSingleStep();
+				timer.ExecuteSingleStep(cycles);
+				ppu.ExecuteSingleStep(cycles);
+				apu.ExecuteSingleStep(cycles);
+			}
 			totalCycles += cycles;
 
 			const int dotPerFrame = 70_224;
@@ -143,6 +171,7 @@ internal static class Program
 			if (totalCycles >= cyclesPerFrame)
 			{
 				totalCycles -= cyclesPerFrame;
+				_measureFrame = (_frameCounter++ % 60) == 0; // sample one frame per emulated second
 
 				Task.Run(() =>
 				{
@@ -206,6 +235,36 @@ internal static class Program
 			}
 		}
 
+		cpu.Save();
+
+		ppu.Dispose();
+
+		var seconds = _sampledCycles / 1_048_576.0; // M-cycles per emulated second
+		var cpuMs = _cpuTicks * 1000.0 / Stopwatch.Frequency;
+		var timerMs = _timerTicks * 1000.0 / Stopwatch.Frequency;
+		var ppuMs = _ppuTicks * 1000.0 / Stopwatch.Frequency;
+		var apuMs = _apuTicks * 1000.0 / Stopwatch.Frequency;
+		var totalMs = cpuMs + timerMs + ppuMs + apuMs;
+
+		StreamWriter sw = new StreamWriter("hw_times.txt");
+		sw.WriteLine($"CPU: {cpuMs:F1}");
+		sw.WriteLine($"TIMER: {timerMs:F1}");
+		sw.WriteLine($"PPU: {ppuMs:F1}");
+		sw.WriteLine($"APU: {apuMs:F1}");
+		sw.WriteLine($"SAMPLED_SECONDS: {seconds:F2}");
+		if (seconds > 0 && totalMs > 0)
+		{
+			sw.WriteLine($"CPU_PER_SEC: {cpuMs / seconds:F3}");
+			sw.WriteLine($"TIMER_PER_SEC: {timerMs / seconds:F3}");
+			sw.WriteLine($"PPU_PER_SEC: {ppuMs / seconds:F3}");
+			sw.WriteLine($"APU_PER_SEC: {apuMs / seconds:F3}");
+			sw.WriteLine($"CPU_SHARE: {cpuMs / totalMs * 100:F1} %");
+			sw.WriteLine($"TIMER_SHARE: {timerMs / totalMs * 100:F1} %");
+			sw.WriteLine($"PPU_SHARE: {ppuMs / totalMs * 100:F1} %");
+			sw.WriteLine($"APU_SHARE: {apuMs / totalMs * 100:F1} %");
+		}
+		sw.Close();
+
         if (audioStream != IntPtr.Zero)
             SDL.DestroyAudioStream(audioStream);
 
@@ -265,19 +324,12 @@ internal static class Program
 
                 for (int y = 0; y < 144; y++)
                 {
+					var off = y * 160;
+					var rowStartIndex = y * (pitch >> 1);
                     for (int x = 0; x < 160; x++)
-                    {
-                        // Calculate the exact 1D index inside the pitch-aligned buffer
-                        // Note: pitch is in bytes, so divide by 2 to get the index for ushort (2 bytes)
-
-                        // Example: Fill with a solid color or specific pattern
-                        
-						int index = (y * (pitch >> 1)) | x;
-						// var red = (gpu.FrameBuffer2[x, y] & 0x7C00) >> 10;
-						// var green = (gpu.FrameBuffer2[x, y] & 0x03E0) >> 5;
-						// var blue = (gpu.FrameBuffer2[x, y] & 0x001F);
-						// pixels[index] = (ushort)((blue << 11) | (green << 6) | red);
-						var pixelColor = gpu.FrameBuffer2[x, y];
+                    {   
+						int index = rowStartIndex | x;
+						var pixelColor = gpu.FrameBuffer2[off + x];
                         pixels[index] = (ushort)(((pixelColor & 0x7C00) >> 10) | ((pixelColor & 0x03E0) << 1) | ((pixelColor & 0x001F) << 11));
                     }
                 }

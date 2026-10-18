@@ -3,6 +3,8 @@
 
 *.gb
 *.gbc
+*.ram
+*.rtc
 
 # User-specific files
 *.suo

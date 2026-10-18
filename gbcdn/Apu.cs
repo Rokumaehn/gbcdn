@@ -1,3 +1,5 @@
+using System.Numerics;
+
 namespace GbcDN;
 
 // SEE: https://gbdev.io/pandocs/Audio.html
@@ -24,6 +26,8 @@ public sealed class Apu
 	private int _frameSequencerCounter;
 	private int _frameSequencerStep;
 	private int _sampleAccumulator;
+	private int _sampleIncrement;
+	private int _sampleTicksRemaining;
 	private float _oversampleL;
 	private float _oversampleR;
 	private int _oversampleCount;
@@ -44,6 +48,8 @@ public sealed class Apu
 		SampleRate = sampleRate;
 		Buffer = new AudioRingBuffer(sampleRate / 2);
 		_dcBlockCoefficient = MathF.Exp(-2f * MathF.PI * DcBlockCutoffHz / sampleRate);
+		_sampleIncrement = SampleRate * OversampleFactor;
+		_sampleTicksRemaining = (TCyclesPerSecond + _sampleIncrement - 1) / _sampleIncrement;
 
 		_square1 = new SquareChannel(cpu, 0xFF11, true);
 		_square2 = new SquareChannel(cpu, 0xFF16, false);
@@ -53,23 +59,23 @@ public sealed class Apu
 		_cpu.OnMemoryWrite[0x10] = value => { if (Powered) _cpu.Memory[0xFF10] = (byte)(value & 0x7F); }; // NR10
 		_cpu.OnMemoryWrite[0x11] = value => { if (Powered) _square1.WriteDutyAndLength(value); }; // NR11
 		_cpu.OnMemoryWrite[0x12] = value => { if (Powered) _square1.WriteEnvelope(value); }; // NR12
-		_cpu.OnMemoryWrite[0x13] = value => { if (Powered) _cpu.Memory[0xFF13] = value; }; // NR13
+		_cpu.OnMemoryWrite[0x13] = value => { if (Powered) _square1.WritePeriodLow(value); }; // NR13
 		_cpu.OnMemoryWrite[0x14] = value => { if (Powered) _square1.WriteControl(value); }; // NR14
 
 		_cpu.OnMemoryWrite[0x16] = value => { if (Powered) _square2.WriteDutyAndLength(value); }; // NR21
 		_cpu.OnMemoryWrite[0x17] = value => { if (Powered) _square2.WriteEnvelope(value); }; // NR22
-		_cpu.OnMemoryWrite[0x18] = value => { if (Powered) _cpu.Memory[0xFF18] = value; }; // NR23
+		_cpu.OnMemoryWrite[0x18] = value => { if (Powered) _square2.WritePeriodLow(value); }; // NR23
 		_cpu.OnMemoryWrite[0x19] = value => { if (Powered) _square2.WriteControl(value); }; // NR24
 
 		_cpu.OnMemoryWrite[0x1A] = value => { if (Powered) _wave.WriteDacEnable(value); }; // NR30
 		_cpu.OnMemoryWrite[0x1B] = value => { if (Powered) _cpu.Memory[0xFF1B] = value; }; // NR31
-		_cpu.OnMemoryWrite[0x1C] = value => { if (Powered) _cpu.Memory[0xFF1C] = (byte)(value & 0x60); }; // NR32
-		_cpu.OnMemoryWrite[0x1D] = value => { if (Powered) _cpu.Memory[0xFF1D] = value; }; // NR33
+		_cpu.OnMemoryWrite[0x1C] = value => { if (Powered) _wave.WriteOutputLevel(value); }; // NR32
+		_cpu.OnMemoryWrite[0x1D] = value => { if (Powered) _wave.WritePeriodLow(value); }; // NR33
 		_cpu.OnMemoryWrite[0x1E] = value => { if (Powered) _wave.WriteControl(value); }; // NR34
 
 		_cpu.OnMemoryWrite[0x20] = value => { if (Powered) _cpu.Memory[0xFF20] = (byte)(value & 0x3F); }; // NR41
 		_cpu.OnMemoryWrite[0x21] = value => { if (Powered) _noise.WriteEnvelope(value); }; // NR42
-		_cpu.OnMemoryWrite[0x22] = value => { if (Powered) _cpu.Memory[0xFF22] = value; }; // NR43
+		_cpu.OnMemoryWrite[0x22] = value => { if (Powered) _noise.WriteFrequency(value); }; // NR43
 		_cpu.OnMemoryWrite[0x23] = value => { if (Powered) _noise.WriteControl(value); }; // NR44
 
 		_cpu.OnMemoryWrite[0x24] = value => { if (Powered) _cpu.Memory[0xFF24] = value; }; // NR50
@@ -81,51 +87,110 @@ public sealed class Apu
 
 	public void ExecuteSingleStep(int cycleDelta)
 	{
-		var tCycles = cycleDelta * 4; // 4 T-cycles per M-cycle
+		var remaining = cycleDelta * 4; // 4 T-cycles per M-cycle
+		var sampleRemaining = _sampleTicksRemaining;
 
-		for (var i = 0; i < tCycles; i++)
+		if (Powered)
 		{
-			if (Powered)
+			var frameSequencerRemaining = FrameSequencerPeriod - _frameSequencerCounter;
+			var sampleIncrement = _sampleIncrement;
+
+			while (remaining > 0)
 			{
-				if (++_frameSequencerCounter >= FrameSequencerPeriod)
+				var chunk = remaining;
+				if (frameSequencerRemaining < chunk)
+					chunk = frameSequencerRemaining;
+				if (sampleRemaining < chunk)
+					chunk = sampleRemaining;
+
+				var next = _square1.TicksUntilTick;
+				if (next < chunk) chunk = next;
+				next = _square2.TicksUntilTick;
+				if (next < chunk) chunk = next;
+				next = _wave.TicksUntilTick;
+				if (next < chunk) chunk = next;
+				next = _noise.TicksUntilTick;
+				if (next < chunk) chunk = next;
+
+				remaining -= chunk;
+				frameSequencerRemaining -= chunk;
+				sampleRemaining -= chunk;
+				_sampleAccumulator += chunk * sampleIncrement;
+				_frameSequencerCounter += chunk;
+
+				_square1.Advance(chunk);
+				_square2.Advance(chunk);
+				_wave.Advance(chunk);
+				_noise.Advance(chunk);
+
+				if (frameSequencerRemaining == 0)
 				{
 					_frameSequencerCounter = 0;
-					_frameSequencerStep = (_frameSequencerStep + 1) & 7;
-
-					if ((_frameSequencerStep & 1) == 0) // steps 0, 2, 4, 6
-					{
-						_square1.ClockLength();
-						_square2.ClockLength();
-						_wave.ClockLength();
-						_noise.ClockLength();
-					}
-
-					if (_frameSequencerStep is 2 or 6)
-						_square1.StepSweep();
-					else if (_frameSequencerStep == 7)
-					{
-						_square1.StepEnvelope();
-						_square2.StepEnvelope();
-						_noise.StepEnvelope();
-					}
+					frameSequencerRemaining = FrameSequencerPeriod;
+					StepFrameSequencer();
 				}
 
-				_square1.Tick();
-				_square2.Tick();
-				_wave.Tick();
-				_noise.Tick();
-			}
+				if (_square1.TimerExpired) _square1.OnTimerExpired();
+				if (_square2.TimerExpired) _square2.OnTimerExpired();
+				if (_wave.TimerExpired) _wave.OnTimerExpired();
+				if (_noise.TimerExpired) _noise.OnTimerExpired();
 
-			_sampleAccumulator += SampleRate * OversampleFactor;
-			if (_sampleAccumulator >= TCyclesPerSecond)
+				if (sampleRemaining == 0)
+				{
+					_sampleAccumulator -= TCyclesPerSecond;
+					EmitSample();
+					sampleRemaining = (TCyclesPerSecond - _sampleAccumulator + sampleIncrement - 1) / sampleIncrement;
+				}
+			}
+		}
+		else
+		{
+			var sampleIncrement = _sampleIncrement;
+
+			while (remaining > 0)
 			{
-				_sampleAccumulator -= TCyclesPerSecond;
-				EmitSample();
+				var chunk = Math.Min(remaining, sampleRemaining);
+				remaining -= chunk;
+				sampleRemaining -= chunk;
+				_sampleAccumulator += chunk * sampleIncrement;
+
+				if (sampleRemaining == 0)
+				{
+					_sampleAccumulator -= TCyclesPerSecond;
+					EmitSample();
+					sampleRemaining = (TCyclesPerSecond - _sampleAccumulator + sampleIncrement - 1) / sampleIncrement;
+				}
 			}
 		}
 
+		_sampleTicksRemaining = sampleRemaining;
+
 		var status = (_square1.Enabled ? 1 : 0) | (_square2.Enabled ? 2 : 0) | (_wave.Enabled ? 4 : 0) | (_noise.Enabled ? 8 : 0);
-		_cpu.Memory[0xFF26] = (byte)((_cpu.Memory[0xFF26] & 0x80) | status);
+		var nr52 = (byte)((_cpu.Memory[0xFF26] & 0x80) | status);
+		if (_cpu.Memory[0xFF26] != nr52)
+			_cpu.Memory[0xFF26] = nr52;
+	}
+
+	private void StepFrameSequencer()
+	{
+		_frameSequencerStep = (_frameSequencerStep + 1) & 7;
+
+		if ((_frameSequencerStep & 1) == 0) // steps 0, 2, 4, 6
+		{
+			_square1.ClockLength();
+			_square2.ClockLength();
+			_wave.ClockLength();
+			_noise.ClockLength();
+		}
+
+		if (_frameSequencerStep is 2 or 6)
+			_square1.StepSweep();
+		else if (_frameSequencerStep == 7)
+		{
+			_square1.StepEnvelope();
+			_square2.StepEnvelope();
+			_noise.StepEnvelope();
+		}
 	}
 
 	private void EmitSample()
@@ -247,7 +312,10 @@ public sealed class Apu
 		}
 
 		public abstract void Trigger();
-		public abstract void Tick();
+		public abstract int TicksUntilTick { get; }
+		public abstract bool TimerExpired { get; }
+		public abstract void Advance(int tCycles);
+		public abstract void OnTimerExpired();
 		public abstract int DigitalOutput { get; }
 	}
 
@@ -307,7 +375,9 @@ public sealed class Apu
 		private readonly int _nr4;
 		private readonly bool _hasSweep;
 		private int _timer;
+		private int _period;
 		private int _dutyPosition;
+		private byte _dutyPattern;
 		private int _sweepTimer;
 		private int _shadowFrequency;
 
@@ -318,6 +388,8 @@ public sealed class Apu
 			_nr3 = nr1Address + 2;
 			_nr4 = nr1Address + 3;
 			_hasSweep = hasSweep;
+			UpdatePeriod();
+			_dutyPattern = DutyPatterns[_cpu.Memory[_nr1] >> 6];
 		}
 
 		protected override int LengthRegister => _nr1;
@@ -332,18 +404,32 @@ public sealed class Apu
 			{
 				_cpu.Memory[_nr3] = (byte)value;
 				_cpu.Memory[_nr4] = (byte)((_cpu.Memory[_nr4] & 0xF8) | (value >> 8));
+				UpdatePeriod();
 			}
 		}
+
+		private void UpdatePeriod() => _period = (2048 - Frequency) * 4;
 
 		private int SweepPace => (_cpu.Memory[0xFF10] >> 4) & 0b111;
 		private bool SweepNegate => (_cpu.Memory[0xFF10] & 0b1000) != 0;
 		private int SweepShift => _cpu.Memory[0xFF10] & 0b111;
 
-		public void WriteDutyAndLength(byte value) => _cpu.Memory[_nr1] = value;
+		public void WriteDutyAndLength(byte value)
+		{
+			_cpu.Memory[_nr1] = value;
+			_dutyPattern = DutyPatterns[value >> 6];
+		}
+
+		public void WritePeriodLow(byte value)
+		{
+			_cpu.Memory[_nr3] = value;
+			UpdatePeriod();
+		}
 
 		public void WriteControl(byte value)
 		{
 			_cpu.Memory[_nr4] = (byte)(value & 0xC7); // bits 5-3 are read-only 0
+			UpdatePeriod();
 			if ((value & 0x80) != 0)
 				Trigger();
 		}
@@ -391,13 +477,14 @@ public sealed class Apu
 			return newFrequency;
 		}
 
-		public override void Tick()
+		public override int TicksUntilTick => Math.Max(1, _period - _timer);
+		public override bool TimerExpired => _timer >= _period;
+		public override void Advance(int tCycles) => _timer += tCycles;
+
+		public override void OnTimerExpired()
 		{
-			if (++_timer >= (2048 - Frequency) * 4)
-			{
-				_timer = 0;
-				_dutyPosition = (_dutyPosition + 1) & 7;
-			}
+			_timer = 0;
+			_dutyPosition = (_dutyPosition + 1) & 7;
 		}
 
 		public override int DigitalOutput
@@ -406,8 +493,7 @@ public sealed class Apu
 			{
 				if (!Enabled || !DacEnabled)
 					return 0;
-				var pattern = DutyPatterns[_cpu.Memory[_nr1] >> 6];
-				return ((pattern >> (7 - _dutyPosition)) & 1) != 0 ? Volume : 0;
+				return ((_dutyPattern >> (7 - _dutyPosition)) & 1) != 0 ? Volume : 0;
 			}
 		}
 	}
@@ -421,12 +507,18 @@ public sealed class Apu
 		private const int Nr34 = 0xFF1E;
 
 		private int _timer;
+		private int _period;
 		private int _position;
 		private int _sampleBuffer;
+		private int _volumeShift;
 
 		public bool DacEnabled;
 
-		public WaveChannel(Cpu cpu) : base(cpu) { }
+		public WaveChannel(Cpu cpu) : base(cpu)
+		{
+			UpdatePeriod();
+			_volumeShift = (_cpu.Memory[Nr32] >> 5) & 0b11;
+		}
 
 		protected override int LengthRegister => Nr31;
 		protected override int LengthEnableRegister => Nr34;
@@ -439,7 +531,22 @@ public sealed class Apu
 			{
 				_cpu.Memory[Nr33] = (byte)value;
 				_cpu.Memory[Nr34] = (byte)((_cpu.Memory[Nr34] & 0xF8) | (value >> 8));
+				UpdatePeriod();
 			}
+		}
+
+		private void UpdatePeriod() => _period = (2048 - Frequency) * 2;
+
+		public void WritePeriodLow(byte value)
+		{
+			_cpu.Memory[Nr33] = value;
+			UpdatePeriod();
+		}
+
+		public void WriteOutputLevel(byte value)
+		{
+			_cpu.Memory[Nr32] = (byte)(value & 0x60);
+			_volumeShift = (value >> 5) & 0b11;
 		}
 
 		public void WriteDacEnable(byte value)
@@ -453,6 +560,7 @@ public sealed class Apu
 		public void WriteControl(byte value)
 		{
 			_cpu.Memory[Nr34] = (byte)(value & 0xC7); // bits 5-3 are read-only 0, bits 2-0 are the period's upper 3 bits
+			UpdatePeriod();
 			if ((value & 0x80) != 0)
 				Trigger();
 		}
@@ -467,15 +575,16 @@ public sealed class Apu
 			_position = 0; // the sample buffer is not refreshed; the first sample read after a trigger is index 1
 		}
 
-		public override void Tick()
+		public override int TicksUntilTick => Math.Max(1, _period - _timer);
+		public override bool TimerExpired => _timer >= _period;
+		public override void Advance(int tCycles) => _timer += tCycles;
+
+		public override void OnTimerExpired()
 		{
-			if (++_timer >= (2048 - Frequency) * 2)
-			{
-				_timer = 0;
-				_position = (_position + 1) & 31;
-				var waveByte = _cpu.Memory[0xFF30 + (_position >> 1)];
-				_sampleBuffer = (_position & 1) == 0 ? waveByte >> 4 : waveByte & 0x0F;
-			}
+			_timer = 0;
+			_position = (_position + 1) & 31;
+			var waveByte = _cpu.Memory[0xFF30 + (_position >> 1)];
+			_sampleBuffer = (_position & 1) == 0 ? waveByte >> 4 : waveByte & 0x0F;
 		}
 
 		public override int DigitalOutput
@@ -485,11 +594,10 @@ public sealed class Apu
 				if (!Enabled || !DacEnabled)
 					return 0;
 
-				var volumeShift = (_cpu.Memory[Nr32] >> 5) & 0b11;
-				if (volumeShift == 0)
+				if (_volumeShift == 0)
 					return 0;
 
-				return _sampleBuffer >> (volumeShift - 1);
+				return _sampleBuffer >> (_volumeShift - 1);
 			}
 		}
 	}
@@ -502,24 +610,33 @@ public sealed class Apu
 		private const int Nr44 = 0xFF23;
 
 		private int _timer;
+		private int _period;
+		private bool _frozen;
+		private bool _shortMode;
 		private ushort _lfsr;
 
-		public NoiseChannel(Cpu cpu) : base(cpu) { }
+		public NoiseChannel(Cpu cpu) : base(cpu) => UpdatePeriod();
 
 		protected override int LengthRegister => Nr41;
 		protected override int LengthEnableRegister => Nr44;
 		protected override int EnvelopeRegister => Nr42;
 		protected override int MaxLength => 64;
 
-		private int Period
+		private void UpdatePeriod()
 		{
-			get
-			{
-				var nr43 = _cpu.Memory[Nr43];
-				var divisorCode = nr43 & 0b111;
-				var divisor = divisorCode == 0 ? 8 : divisorCode * 16;
-				return divisor << (nr43 >> 4);
-			}
+			var nr43 = _cpu.Memory[Nr43];
+			var divisorCode = nr43 & 0b111;
+			var divisor = divisorCode == 0 ? 8 : divisorCode * 16;
+			var shift = nr43 >> 4;
+			_period = divisor << shift;
+			_frozen = shift >= 14; // clock shifts 14 and 15 stop the LFSR from being clocked
+			_shortMode = (nr43 & 0b1000) != 0;
+		}
+
+		public void WriteFrequency(byte value)
+		{
+			_cpu.Memory[Nr43] = value;
+			UpdatePeriod();
 		}
 
 		public void WriteControl(byte value)
@@ -538,19 +655,20 @@ public sealed class Apu
 			_lfsr = 0;
 		}
 
-		public override void Tick()
+		public override int TicksUntilTick => _frozen ? int.MaxValue : Math.Max(1, _period - _timer);
+		public override bool TimerExpired => !_frozen && _timer >= _period;
+		public override void Advance(int tCycles)
 		{
-			if ((_cpu.Memory[Nr43] >> 4) >= 14) // clock shifts 14 and 15 stop the LFSR from being clocked
-				return;
+			if (!_frozen)
+				_timer += tCycles;
+		}
 
-			_timer++;
-			if (_timer < Period)
-				return;
-
+		public override void OnTimerExpired()
+		{
 			_timer = 0;
 			var feedback = ((_lfsr ^ (_lfsr >> 1)) & 1) ^ 1; // XNOR of bits 0 and 1
 			_lfsr = (ushort)((_lfsr >> 1) | (feedback << 14));
-			if ((_cpu.Memory[Nr43] & 0b1000) != 0)
+			if (_shortMode)
 				_lfsr = (ushort)((_lfsr & ~0x40) | (feedback << 6));
 		}
 
@@ -566,13 +684,16 @@ public sealed class Apu
 public sealed class AudioRingBuffer
 {
 	private readonly short[] _samples;
+	private readonly int _mask;
 	private readonly object _sync = new();
 	private int _head;
 	private int _count;
 
 	public AudioRingBuffer(int capacity)
 	{
-		_samples = new short[Math.Max(2, capacity)];
+		var size = (int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(2, capacity));
+		_samples = new short[size];
+		_mask = size - 1;
 	}
 
 	public int Capacity => _samples.Length;
@@ -596,9 +717,15 @@ public sealed class AudioRingBuffer
 		lock (_sync)
 		{
 			var count = Math.Min(destination.Length, _count);
-			for (var i = 0; i < count; i++)
-				destination[i] = _samples[(_head + i) % _samples.Length];
-			_head = (_head + count) % _samples.Length;
+			if (count == 0)
+				return 0;
+
+			var first = Math.Min(count, _samples.Length - _head);
+			_samples.AsSpan(_head, first).CopyTo(destination);
+			if (count > first)
+				_samples.AsSpan(0, count - first).CopyTo(destination[first..]);
+
+			_head = (_head + count) & _mask;
 			_count -= count;
 			return count;
 		}
@@ -607,9 +734,9 @@ public sealed class AudioRingBuffer
 	private void Add(short sample)
 	{
 		if (_count == _samples.Length)
-			_head = (_head + 1) % _samples.Length;
+			_head = (_head + 1) & _mask;
 		else
 			_count++;
-		_samples[(_head + _count - 1) % _samples.Length] = sample;
+		_samples[(_head + _count - 1) & _mask] = sample;
 	}
 }

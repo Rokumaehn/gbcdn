@@ -28,6 +28,7 @@ public sealed class Cpu
 	private readonly byte[] _ram;
 	private bool _ramEnabled;
 	private int _ramBankOffset;
+	private byte _ramBankSel;
 	public readonly byte[] _sram = new byte[0x8000];
 	public int _sramBankOffset = 1;
 	private int _vramBankOffset = 0;
@@ -71,6 +72,13 @@ public sealed class Cpu
 
 	public readonly Action<byte>?[] OnMemoryWrite = new Action<byte>?[256];
 
+	public Action<byte, byte>? OnRtcWrite;
+	public Func<byte, byte>? OnRtcRead;
+	public event Action<string?>? OnLoad;
+	public event Action<string?>? OnSave;
+	private readonly string? _pathToRom;
+	private readonly byte _cartridgeType;
+
 	public enum MBCs
 	{
 		None,
@@ -82,11 +90,13 @@ public sealed class Cpu
 
 	public MBCs Mbc { get; private set; }
 
-	public Cpu(byte[] rom)
+	public Cpu(byte[] rom, string? pathToRom = null)
 	{
+		_pathToRom = pathToRom;
 		// initialize ROM
 		_rom = rom;
-		switch (_rom[0x147])
+		_cartridgeType = _rom[0x147];
+		switch (_cartridgeType)
 		{
 			case 0x00:
 				Mbc = MBCs.None;
@@ -154,6 +164,36 @@ public sealed class Cpu
 		IF = IFBits.VBlank;
 		for (int i = 0; i <= 0xFF; i++)
 			WriteMem(0xFF00 + i, 0);
+		
+		if(_cartridgeType is 0x03 or 0x10 or 0x13) // MBC1/3 with battery-backed RAM
+			Load();
+	}
+
+	public void Save()
+	{
+		if((_cartridgeType is 0x03 or 0x10 or 0x13) && _ram.Length > 0 && _pathToRom != null)
+		{
+			using (var writer = new BinaryWriter(File.Open(Path.ChangeExtension(_pathToRom, ".ram"), FileMode.OpenOrCreate)))
+			{
+				writer.Write(_ram);
+			}
+		}
+
+		OnSave?.Invoke(_pathToRom);
+	}
+
+	public void Load()
+	{
+		// MBC1/3 with battery-backed RAM
+		if((_cartridgeType is 0x03 or 0x10 or 0x13) && _ram.Length > 0 && _pathToRom != null && File.Exists(Path.ChangeExtension(_pathToRom, ".ram")))
+		{
+			using (var reader = new BinaryReader(File.Open(Path.ChangeExtension(_pathToRom, ".ram"), FileMode.Open)))
+			{
+				reader.Read(_ram, 0, _ram.Length);
+			}
+		}
+
+		OnLoad?.Invoke(_pathToRom);
 	}
 
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -206,7 +246,7 @@ public sealed class Cpu
 			return 1;
 
 		// read opcode
-		var op = ReadMem(PC++);
+		var op = ReadRom(PC++);
 
 		// handle opcode range 0x40..0xBF
 		switch (op >> 6)
@@ -265,7 +305,7 @@ public sealed class Cpu
 				return 1;
 
 			case 0x06: // LD B, n8 [LD r8,n8]
-				B = ReadMem(PC++);
+				B = ReadRom(PC++);
 				return 2;
 
 			case 0x07: // RLCA [RLCA]
@@ -300,7 +340,7 @@ public sealed class Cpu
 				return 1;
 
 			case 0x0E: // LD C, n8 [LD r8,n8]
-				C = ReadMem(PC++);
+				C = ReadRom(PC++);
 				return 2;
 
 			case 0x0F: // RRCA [RRCA]
@@ -335,7 +375,7 @@ public sealed class Cpu
 				return 1;
 
 			case 0x16: // LD D, n8 [LD r8,n8]
-				D = ReadMem(PC++);
+				D = ReadRom(PC++);
 				return 2;
 
 			case 0x17: // RLA [RLA]
@@ -372,7 +412,7 @@ public sealed class Cpu
 				return 1;
 
 			case 0x1E: // LD E, n8 [LD r8,n8]
-				E = ReadMem(PC++);
+				E = ReadRom(PC++);
 				return 2;
 
 			case 0x1F: // RRA [RRA]
@@ -410,7 +450,7 @@ public sealed class Cpu
 				return 1;
 
 			case 0x26: // LD H, n8 [LD r8,n8]
-				H = ReadMem(PC++);
+				H = ReadRom(PC++);
 				return 2;
 
 			case 0x27: // DAA [DAA]
@@ -453,7 +493,7 @@ public sealed class Cpu
 				return 1;
 
 			case 0x2E: // LD L, n8 [LD r8,n8]
-				L = ReadMem(PC++);
+				L = ReadRom(PC++);
 				return 2;
 
 			case 0x2F: // CPL [CPL]
@@ -494,7 +534,7 @@ public sealed class Cpu
 				}
 
 			case 0x36: // LD [HL], n8 [LD [HL],n8]
-				WriteMem(HL, ReadMem(PC++));
+				WriteMem(HL, ReadRom(PC++));
 				return 3;
 
 			case 0x37: // SCF [SCF]
@@ -526,7 +566,7 @@ public sealed class Cpu
 				return 1;
 
 			case 0x3E: // LD A, n8 [LD r8,n8]
-				A = ReadMem(PC++);
+				A = ReadRom(PC++);
 				return 2;
 
 			case 0x3F: // CCF [CCF]
@@ -560,7 +600,7 @@ public sealed class Cpu
 				return 4;
 
 			case 0xC6: // ADD A, n8 [ADD A,n8]
-				Add(ref A, ReadMem(PC++), false, true);
+				Add(ref A, ReadRom(PC++), false, true);
 				return 2;
 
 			case 0xC7: // RST $00 [RST vec]
@@ -601,7 +641,7 @@ public sealed class Cpu
 				return 6;
 
 			case 0xCE: // ADC A, n8 [ADC A,n8]
-				Add(ref A, ReadMem(PC++), FlagC, true);
+				Add(ref A, ReadRom(PC++), FlagC, true);
 				return 2;
 
 			case 0xD0: // RET NC
@@ -625,7 +665,7 @@ public sealed class Cpu
 				return 4;
 
 			case 0xD6: // SUB A, n8 [SUB A,n8]
-				Sub(ref A, ReadMem(PC++), false, true);
+				Sub(ref A, ReadRom(PC++), false, true);
 				return 2;
 
 			case 0xD8: // RET C
@@ -647,11 +687,11 @@ public sealed class Cpu
 				return ConditionalCall(FlagC);
 
 			case 0xDE: // SBC A, n8 [SBC A,n8]
-				Sub(ref A, ReadMem(PC++), FlagC, true);
+				Sub(ref A, ReadRom(PC++), FlagC, true);
 				return 2;
 
 			case 0xE0: // LDH [a8], A [LDH [n16],A]
-				WriteMem(0xFF00 + ReadMem(PC++), A);
+				WriteMem(0xFF00 + ReadRom(PC++), A);
 				return 3;
 
 			case 0xE1: // POP HL [POP r16]
@@ -667,12 +707,12 @@ public sealed class Cpu
 				return 4;
 
 			case 0xE6: // AND A, n8 [AND A, n8]
-				AndA(ReadMem(PC++));
+				AndA(ReadRom(PC++));
 				return 2;
 
 			case 0xE8: // ADD SP, e8 [ADD SP,e8]
 				{
-					var offset = ReadMem(PC++);
+					var offset = ReadRom(PC++);
 					var sp = (byte)SP;
 					Add(ref sp, offset, false, true);
 					FlagZ = false;
@@ -689,11 +729,11 @@ public sealed class Cpu
 				return 4;
 
 			case 0xEE: // XOR A, n8 [XOR A,n8]
-				XorA(ReadMem(PC++));
+				XorA(ReadRom(PC++));
 				return 2;
 
 			case 0xF0: // LDH A, [a8] [LDH A,[n16]]
-				A = Memory[0xFF00 + ReadMem(PC++)];
+				A = Memory[0xFF00 + ReadRom(PC++)];
 				return 3;
 
 			case 0xF1: // POP AF [POP AF]
@@ -714,12 +754,12 @@ public sealed class Cpu
 				return 4;
 
 			case 0xF6: // OR A, n8 [OR A,n8]
-				OrA(ReadMem(PC++));
+				OrA(ReadRom(PC++));
 				return 2;
 
 			case 0xF8: // LD HL, SP + e8 [LD HL,SP+e8]
 				{
-					var offset = ReadMem(PC++);
+					var offset = ReadRom(PC++);
 					var sp = (byte)SP;
 					Add(ref sp, offset, false, true);
 					FlagZ = false;
@@ -740,7 +780,7 @@ public sealed class Cpu
 				return 1;
 
 			case 0xFE: // CP A, n8
-				CpA(ReadMem(PC++));
+				CpA(ReadRom(PC++));
 				return 2;
 
 			case 0xD3:
@@ -995,14 +1035,22 @@ public sealed class Cpu
 			}
 			else if (addr < 0x6000)
 			{
-				// select RAM Bank number or upper bits of ROM Bank Number
-				// switching happens infrequently, so we can afford to copy data back and forth
-				var ramBankOffset = (value & 0x3) * 0x2000;
-				if (ramBankOffset != _ramBankOffset)
+				_ramBankSel = value;
+				if(value > 7)
 				{
-					Array.Copy(Memory, 0xA000, _ram, _ramBankOffset, 0x2000);
-					_ramBankOffset = ramBankOffset;
-					Array.Copy(_ram, _ramBankOffset, Memory, 0xA000, 0x2000);
+					// handle RTC
+				}
+				else
+				{
+					// select RAM Bank number or upper bits of ROM Bank Number
+					// switching happens infrequently, so we can afford to copy data back and forth
+					var ramBankOffset = (value & 0x3) * 0x2000;
+					if (ramBankOffset != _ramBankOffset)
+					{
+						Array.Copy(Memory, 0xA000, _ram, _ramBankOffset, 0x2000);
+						_ramBankOffset = ramBankOffset;
+						Array.Copy(_ram, _ramBankOffset, Memory, 0xA000, 0x2000);
+					}
 				}
 			}
 			return;
@@ -1014,6 +1062,16 @@ public sealed class Cpu
 			else
 				VRamUpper[addr & 0x1FFF] = value;
 			return;
+		}
+		else if(addr >= 0xA000 && addr < 0xC000)
+		{
+			if(_ramBankSel > 7)
+			{
+				// handle RTC
+				OnRtcWrite?.Invoke(_ramBankSel, value);
+			}
+			else
+				Memory[addr] = value;
 		}
 		else if (addr >= 0xC000 && addr < 0xD000)
 		{
@@ -1049,10 +1107,26 @@ public sealed class Cpu
 	}
 
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
-	private byte ReadMem(ushort address) // serve 0x4000 .. 0x7FFF from banked ROM area
+	private byte ReadRom(ushort address) // serve 0x4000 .. 0x7FFF from banked ROM area
 	{
 		if(address >> 14 == 0b01)
 			return _rom[_romBankOneOffset + address];
+		return Memory[address];
+	}
+
+	[MethodImpl(MethodImplOptions.AggressiveInlining)]
+	private byte ReadMem(ushort address) // serve 0x4000 .. 0x7FFF from banked ROM area
+	{
+		if(address >= 0xA000 && address < 0xC000)
+		{
+			if(_ramBankSel > 7)
+			{
+				// handle RTC
+				return OnRtcRead?.Invoke(_ramBankSel) ?? 0;
+			}
+			else
+				return Memory[address];
+		}
 		else if (address >= 0xC000 && address < 0xD000)
 		{
 			return _sram[address & 0x0FFF];
@@ -1061,6 +1135,9 @@ public sealed class Cpu
 		{
 			return _sram[(address & 0x0FFF) + (_sramBankOffset << 12)];
 		}
+		else if(address >> 14 == 0b01)
+			return _rom[_romBankOneOffset + address];
+
 		return Memory[address];
 	}
 	// private byte ReadMem(ushort address) // serve 0x4000 .. 0x7FFF from banked ROM area
