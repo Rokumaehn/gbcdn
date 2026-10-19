@@ -82,7 +82,8 @@ public sealed class Cpu
 	public event Action<string?>? OnLoad;
 	public event Action<string?>? OnSave;
 	private readonly string? _pathToRom;
-	private readonly byte _cartridgeType;
+	public readonly byte _cartridgeType;
+	public readonly bool _hasRtc;
 
 	public enum MBCs
 	{
@@ -101,6 +102,7 @@ public sealed class Cpu
 		// initialize ROM
 		_rom = rom;
 		_cartridgeType = _rom[0x147];
+		_hasRtc = _cartridgeType is 0x0F or 0x10;
 		switch (_cartridgeType)
 		{
 			case 0x00:
@@ -1158,7 +1160,8 @@ public sealed class Cpu
 			else if (addr < 0x8000)
 			{
 				// handle RTC Latch write
-				OnRtcLatchWrite?.Invoke(addr, value);
+				if(_hasRtc)
+					OnRtcLatchWrite?.Invoke(addr, value);
 			}
 			return;
 		}
@@ -1172,7 +1175,7 @@ public sealed class Cpu
 		}
 		else if(addr >= 0xA000 && addr < 0xC000)
 		{
-			if(_ramBankSel > 7)
+			if(_ramBankSel >= 0x08 && _ramBankSel <= 0x0C && _hasRtc)
 			{
 				// handle RTC
 				OnRtcWrite?.Invoke(_ramBankSel, value);
@@ -1226,7 +1229,7 @@ public sealed class Cpu
 	{
 		if(address >= 0xA000 && address < 0xC000)
 		{
-			if(_ramBankSel > 7)
+			if(_ramBankSel >= 0x08 && _ramBankSel <= 0x0C && _hasRtc)
 			{
 				// handle RTC
 				return OnRtcRead?.Invoke(_ramBankSel) ?? 0;

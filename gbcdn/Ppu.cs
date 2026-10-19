@@ -143,6 +143,9 @@ public sealed class Ppu
 	GCHandle handleFb;
 	IntPtr ptrFb;
 	private bool _statInterruptLine;
+	private bool WindowYCondition;
+	private int WPC;
+	private int WLY;
 
 	public Ppu(Cpu cpu)
 	{
@@ -196,7 +199,11 @@ public sealed class Ppu
 			if (++LY > 153)
 				LY = 0;
 			if (LY == ScreenHeight) // VBlank?
+			{
+				WindowYCondition = false;
+				WLY = 0;
 				_cpu.RequestInterrupt(Cpu.IFBits.VBlank);
+			}
 		}
 
 		var mode = GetMode();
@@ -271,40 +278,43 @@ public sealed class Ppu
 			}
 		}
 
+		var MasterPriorityEnabled = lcdc.HasFlag(LcdcBits.PriorityEnabled);
+		if(!WindowYCondition && (WY == LY))
+			WindowYCondition = true;
+		WPC = 7;
+		var windowActive = lcdc.HasFlag(LcdcBits.WindowEnable) && WindowYCondition;
+		var windowRendered = false;
+
 		unsafe
 		{
 			ushort *fbPtr = (ushort*)ptrFb.ToPointer() + screenY * ScreenWidth;
-			var backgroundEnabled = lcdc.HasFlag(LcdcBits.PriorityEnabled);
-			var backgroundBlankColor = (ushort)(((int)_cpu.CRamBg[1] << 8) | _cpu.CRamBg[0]);
-			for (var screenX = 0; screenX < ScreenWidth; screenX++, fbPtr++)
+			for (var screenX = 0; screenX < ScreenWidth; screenX++, fbPtr++, WPC++)
 			{
 				var backgroundAndWindowColorIndex = 0;
 				BGAttributeBits bgwndAttribs = BGAttributeBits.None;
-
-				if (backgroundEnabled)
+				if (windowActive && WPC >= WX)
 				{
-					if (lcdc.HasFlag(LcdcBits.WindowEnable))
-					{
-						var x = screenX - (WX - 7);
-						var y = screenY - WY;
-						if (x >= 0 && y >= 0)
-							backgroundAndWindowColorIndex = GetBackgroundTileMapPixelIndex(windowTileIndexBaseAddr, x, y, out bgwndAttribs);
-						else
-							backgroundAndWindowColorIndex = GetBackgroundTileMapPixelIndex(backgroundTileIndexBaseAddr, (byte)(SCX + screenX), (byte)(SCY + screenY), out bgwndAttribs);
-					}
-					else
-						backgroundAndWindowColorIndex = GetBackgroundTileMapPixelIndex(backgroundTileIndexBaseAddr, (byte)(SCX + screenX), (byte)(SCY + screenY), out bgwndAttribs);
-
-					*fbPtr = (ushort)(((int)_cpu.CRamBg[((int)bgwndAttribs & 0x7) << 3 | (backgroundAndWindowColorIndex<<1) | 1] << 8) | (((int)_cpu.CRamBg[((int)bgwndAttribs & 0x7) << 3 | (backgroundAndWindowColorIndex<<1)]) << 0));
-
-					if (bgwndAttribs.HasFlag(BGAttributeBits.Priority) && backgroundAndWindowColorIndex != 0)
-					{
-						continue;
-					}
+					backgroundAndWindowColorIndex = GetBackgroundTileMapPixelIndex(
+						windowTileIndexBaseAddr,
+						screenX - (WX - 7),
+						WLY & 0xFF,          // window's own tilemap row
+						out bgwndAttribs);
+					windowRendered = true;
 				}
 				else
 				{
-					*fbPtr = backgroundBlankColor;
+					backgroundAndWindowColorIndex = GetBackgroundTileMapPixelIndex(
+						backgroundTileIndexBaseAddr,
+						(byte)(SCX + screenX),
+						(byte)(SCY + screenY),
+						out bgwndAttribs);
+				}
+
+				*fbPtr = (ushort)(((int)_cpu.CRamBg[((int)bgwndAttribs & 0x7) << 3 | (backgroundAndWindowColorIndex<<1) | 1] << 8) | (((int)_cpu.CRamBg[((int)bgwndAttribs & 0x7) << 3 | (backgroundAndWindowColorIndex<<1)]) << 0));
+
+				if (MasterPriorityEnabled && bgwndAttribs.HasFlag(BGAttributeBits.Priority) && backgroundAndWindowColorIndex != 0)
+				{
+					continue;
 				}
 
 				// Render only pre-filtered OAM sprites for this pixel
@@ -313,7 +323,7 @@ public sealed class Ppu
 				{
 					ref var oam = ref visibleOAMsInLine[i];
 
-					if (screenXForOAM < oam.X || screenXForOAM >= oam.X + oamWidth || (backgroundEnabled && oam.HasPriority && backgroundAndWindowColorIndex != 0))
+					if (screenXForOAM < oam.X || screenXForOAM >= oam.X + oamWidth || (MasterPriorityEnabled && oam.HasPriority && backgroundAndWindowColorIndex != 0))
 						continue;
 
 					var oamColorIndex = GetTilePixelColorIndex(oam.TileIndex, oam.XFlip ? oam.X + 7 - screenXForOAM : screenXForOAM - oam.X, oam.TileY, oam.PaletteBank==1);
@@ -324,6 +334,8 @@ public sealed class Ppu
 					}
 				}
 			}
+			if (windowRendered)
+    			WLY++;
 		}
 
 	}
@@ -334,7 +346,7 @@ public sealed class Ppu
 		var tilemapX = x >> 3;
 		var tilemapY = y >> 3;
 
-		attribs = (BGAttributeBits)_cpu.VRamUpper[0x1800 | (tilemapY << 5) | tilemapX];
+		attribs = (BGAttributeBits)_cpu.VRamUpper[((tileIndexBaseAddr & 0xC00) == 0xC00 ? 0x1C00 : 0x1800) | (tilemapY << 5) | tilemapX];
 		var tileIndexAddress = tileIndexBaseAddr | (tilemapY << 5) | tilemapX;
 		int tileIndex = _cpu.Memory[tileIndexAddress];
 		if (!LCDC.HasFlag(LcdcBits.BackgroundAndWindowTileDataSelect))
