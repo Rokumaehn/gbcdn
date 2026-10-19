@@ -152,15 +152,11 @@ public sealed class Ppu
 		_cpu = cpu;
 		_cpu.OnMemoryWrite[0x41] = value => _cpu.Memory[0xFF41] = (byte)((_cpu.Memory[0xFF41] & 0b1000_0111) | (value & ~0b1000_0111)); // STAT
 		_cpu.OnMemoryWrite[0x46] = value => 
-		{ 
+		{
 			_cpu.Memory[0xFF46] = value; 
 			var srcAddr = value << 8;
-			if(srcAddr >= 0xC000 && srcAddr < 0xD000)
-				Array.Copy(_cpu._sram, srcAddr & 0x0FFF, _cpu.Memory, 0xFE00, 0xA0);
-			else if (srcAddr >= 0xD000 && srcAddr < 0xE000)
-				Array.Copy(_cpu._sram, (srcAddr & 0x0FFF) + (_cpu._sramBankOffset << 12), _cpu.Memory, 0xFE00, 0xA0);
-			else
-				Array.Copy(_cpu.Memory, srcAddr, _cpu.Memory, 0xFE00, 0xA0); 
+			for (var i = 0; i < 0xA0; i++)
+				_cpu.Memory[0xFE00 + i] = _cpu.ReadMemoryForDma(srcAddr + i);
 		}; // DMA: OAM DMA source address & start
 		STAT = StatBits.Reserved7;
 		LCDC = LcdcBits.PriorityEnabled | LcdcBits.BackgroundAndWindowTileDataSelect | LcdcBits.LCDEnable;
@@ -204,6 +200,9 @@ public sealed class Ppu
 		}
 
 		var mode = GetMode();
+
+		if (mode == PpuMode.HBlank && prevMode != PpuMode.HBlank)
+			_cpu.ProcessHdmaBlock();
 
 		var stat = STAT;
 		stat &= (StatBits)0b1111_1000;
@@ -275,28 +274,37 @@ public sealed class Ppu
 		unsafe
 		{
 			ushort *fbPtr = (ushort*)ptrFb.ToPointer() + screenY * ScreenWidth;
+			var backgroundEnabled = lcdc.HasFlag(LcdcBits.PriorityEnabled);
+			var backgroundBlankColor = (ushort)(((int)_cpu.CRamBg[1] << 8) | _cpu.CRamBg[0]);
 			for (var screenX = 0; screenX < ScreenWidth; screenX++, fbPtr++)
 			{
 				var backgroundAndWindowColorIndex = 0;
 				BGAttributeBits bgwndAttribs = BGAttributeBits.None;
-				
-				if (lcdc.HasFlag(LcdcBits.WindowEnable))
+
+				if (backgroundEnabled)
 				{
-					var x = screenX - (WX - 7);
-					var y = screenY - WY;
-					if (x >= 0 && y >= 0)
-						backgroundAndWindowColorIndex = GetBackgroundTileMapPixelIndex(windowTileIndexBaseAddr, x, y, out bgwndAttribs);
+					if (lcdc.HasFlag(LcdcBits.WindowEnable))
+					{
+						var x = screenX - (WX - 7);
+						var y = screenY - WY;
+						if (x >= 0 && y >= 0)
+							backgroundAndWindowColorIndex = GetBackgroundTileMapPixelIndex(windowTileIndexBaseAddr, x, y, out bgwndAttribs);
+						else
+							backgroundAndWindowColorIndex = GetBackgroundTileMapPixelIndex(backgroundTileIndexBaseAddr, (byte)(SCX + screenX), (byte)(SCY + screenY), out bgwndAttribs);
+					}
 					else
 						backgroundAndWindowColorIndex = GetBackgroundTileMapPixelIndex(backgroundTileIndexBaseAddr, (byte)(SCX + screenX), (byte)(SCY + screenY), out bgwndAttribs);
+
+					*fbPtr = (ushort)(((int)_cpu.CRamBg[((int)bgwndAttribs & 0x7) << 3 | (backgroundAndWindowColorIndex<<1) | 1] << 8) | (((int)_cpu.CRamBg[((int)bgwndAttribs & 0x7) << 3 | (backgroundAndWindowColorIndex<<1)]) << 0));
+
+					if (bgwndAttribs.HasFlag(BGAttributeBits.Priority) && backgroundAndWindowColorIndex != 0)
+					{
+						continue;
+					}
 				}
 				else
-					backgroundAndWindowColorIndex = GetBackgroundTileMapPixelIndex(backgroundTileIndexBaseAddr, (byte)(SCX + screenX), (byte)(SCY + screenY), out bgwndAttribs);
-				
-				*fbPtr = (ushort)(((int)_cpu.CRamBg[((int)bgwndAttribs & 0x7) << 3 | (backgroundAndWindowColorIndex<<1) | 1] << 8) | (((int)_cpu.CRamBg[((int)bgwndAttribs & 0x7) << 3 | (backgroundAndWindowColorIndex<<1)]) << 0));
-
-				if(lcdc.HasFlag(LcdcBits.PriorityEnabled) && bgwndAttribs.HasFlag(BGAttributeBits.Priority) && backgroundAndWindowColorIndex != 0)
 				{
-					continue;
+					*fbPtr = backgroundBlankColor;
 				}
 
 				// Render only pre-filtered OAM sprites for this pixel
@@ -305,13 +313,14 @@ public sealed class Ppu
 				{
 					ref var oam = ref visibleOAMsInLine[i];
 
-					if (screenXForOAM < oam.X || screenXForOAM >= oam.X + oamWidth || (lcdc.HasFlag(LcdcBits.PriorityEnabled) && oam.HasPriority && backgroundAndWindowColorIndex != 0))
+					if (screenXForOAM < oam.X || screenXForOAM >= oam.X + oamWidth || (backgroundEnabled && oam.HasPriority && backgroundAndWindowColorIndex != 0))
 						continue;
 
 					var oamColorIndex = GetTilePixelColorIndex(oam.TileIndex, oam.XFlip ? oam.X + 7 - screenXForOAM : screenXForOAM - oam.X, oam.TileY, oam.PaletteBank==1);
 					if (oamColorIndex != 0)
 					{
 						*fbPtr = (ushort)(((int)_cpu.CRamObj[(oam.CGBPalette << 3) | (oamColorIndex<<1) | 1] << 8) | ((int)(_cpu.CRamObj[(oam.CGBPalette << 3) | (oamColorIndex<<1)]) << 0));
+						break; // the first opaque sprite in OAM order wins
 					}
 				}
 			}

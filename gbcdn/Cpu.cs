@@ -32,6 +32,10 @@ public sealed class Cpu
 	public readonly byte[] _sram = new byte[0x8000];
 	public int _sramBankOffset = 1;
 	private int _vramBankOffset = 0;
+	private int _hdmaSource;
+	private int _hdmaDest;
+	private int _hdmaRemaining;
+	private bool _hdmaActive;
 	private bool _isHalted;
 	private int _enableIME; // cycles until IME is enabled (after EI instruction)
 
@@ -73,6 +77,7 @@ public sealed class Cpu
 	public readonly Action<byte>?[] OnMemoryWrite = new Action<byte>?[256];
 
 	public Action<byte, byte>? OnRtcWrite;
+	public Action<int, byte>? OnRtcLatchWrite;
 	public Func<byte, byte>? OnRtcRead;
 	public event Action<string?>? OnLoad;
 	public event Action<string?>? OnSave;
@@ -151,8 +156,22 @@ public sealed class Cpu
 		OnMemoryWrite[0x0F] = value => Memory[0xFF0F] = (byte)(value | 0b1110_0000); // IF
 		OnMemoryWrite[0xFF] = value => Memory[0xFFFF] = (byte)(value & 0b0001_1111); // IE
 		
-		OnMemoryWrite[0x70] = value => _sramBankOffset = ((value==0) ? 1 : (value & 0b111));
-		OnMemoryWrite[0x4F] = value => _vramBankOffset = (value & 0b1);
+		OnMemoryWrite[0x70] = value =>
+		{
+			var bank = value & 0b111;
+			Memory[0xFF70] = (byte)bank;
+			_sramBankOffset = bank == 0 ? 1 : bank;
+		}; // SVBK
+		OnMemoryWrite[0x4F] = value =>
+		{
+			_vramBankOffset = value & 0b1;
+			Memory[0xFF4F] = (byte)(0xFE | _vramBankOffset);
+		}; // VBK
+		OnMemoryWrite[0x51] = value => _hdmaSource = (_hdmaSource & 0x00F0) | (value << 8); // HDMA1
+		OnMemoryWrite[0x52] = value => _hdmaSource = (_hdmaSource & 0xFF00) | (value & 0xF0); // HDMA2
+		OnMemoryWrite[0x53] = value => _hdmaDest = (_hdmaDest & 0x00F0) | ((value & 0x1F) << 8); // HDMA3
+		OnMemoryWrite[0x54] = value => _hdmaDest = (_hdmaDest & 0x1F00) | (value & 0xF0); // HDMA4
+		OnMemoryWrite[0x55] = WriteHdmaControl; // HDMA5
 		OnMemoryWrite[0x68] = value => { CRamBgIndex = value; }; // Background Color RAM
 		OnMemoryWrite[0x69] = value => { CRamBg[CRamBgIndex & 0b111111] = value; if((CRamBgIndex & 0x80) != 0) CRamBgIndex++; }; // Background Color RAM
 		OnMemoryWrite[0x6A] = value => { CRamObjIndex = value; }; // Object Color RAM
@@ -164,6 +183,9 @@ public sealed class Cpu
 		IF = IFBits.VBlank;
 		for (int i = 0; i <= 0xFF; i++)
 			WriteMem(0xFF00 + i, 0);
+
+		_hdmaActive = false;
+		Memory[0xFF55] = 0xFF;
 		
 		if(_cartridgeType is 0x03 or 0x10 or 0x13) // MBC1/3 with battery-backed RAM
 			Load();
@@ -216,6 +238,86 @@ public sealed class Cpu
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
 	public void RequestInterrupt(IFBits flag)
 		=> IF |= flag;
+
+	public void ProcessHdmaBlock()
+	{
+		if (!_hdmaActive)
+			return;
+
+		CopyHdmaBlock();
+		_hdmaRemaining--;
+		if (_hdmaRemaining == 0)
+		{
+			_hdmaActive = false;
+			Memory[0xFF55] = 0xFF;
+		}
+		else
+		{
+			Memory[0xFF55] = (byte)(0x80 | (_hdmaRemaining - 1));
+		}
+	}
+
+	private void WriteHdmaControl(byte value)
+	{
+		if (_hdmaActive)
+		{
+			// writing 0 to bit 7 terminates an active HBlank DMA
+			if ((value & 0x80) == 0)
+			{
+				_hdmaActive = false;
+				Memory[0xFF55] = (byte)(0x80 | (_hdmaRemaining - 1));
+			}
+			return;
+		}
+
+		var blocks = (value & 0x7F) + 1;
+		if ((value & 0x80) == 0)
+		{
+			// general-purpose DMA: transfer everything at once
+			for (var i = 0; i < blocks; i++)
+				CopyHdmaBlock();
+			Memory[0xFF55] = 0xFF;
+		}
+		else
+		{
+			_hdmaRemaining = blocks;
+			_hdmaActive = true;
+			Memory[0xFF55] = (byte)(0x80 | (_hdmaRemaining - 1));
+		}
+	}
+
+	private void CopyHdmaBlock()
+	{
+		for (var i = 0; i < 0x10; i++)
+		{
+			var source = ReadMemoryForDma(_hdmaSource + i);
+			if (_vramBankOffset == 0)
+				Memory[0x8000 | ((_hdmaDest + i) & 0x1FFF)] = source;
+			else
+				VRamUpper[(_hdmaDest + i) & 0x1FFF] = source;
+		}
+
+		_hdmaSource = (_hdmaSource + 0x10) & 0xFFF0;
+		_hdmaDest = (_hdmaDest + 0x10) & 0x1FF0;
+	}
+
+	internal byte ReadMemoryForDma(int address)
+	{
+		address &= 0xFFFF;
+		if (address < 0x4000)
+			return Memory[address];
+		if (address < 0x8000)
+			return _rom[_romBankOneOffset + address];
+		if (address < 0xA000)
+			return _vramBankOffset == 0 ? Memory[address] : VRamUpper[address & 0x1FFF];
+		if (address < 0xC000)
+			return Memory[address];
+		if (address < 0xD000)
+			return _sram[address & 0x0FFF];
+		if (address < 0xE000)
+			return _sram[(address & 0x0FFF) + (_sramBankOffset << 12)];
+		return Memory[address];
+	}
 
 	public int ExecuteSingleStep()
 	{
@@ -1053,6 +1155,11 @@ public sealed class Cpu
 					}
 				}
 			}
+			else if (addr < 0x8000)
+			{
+				// handle RTC Latch write
+				OnRtcLatchWrite?.Invoke(addr, value);
+			}
 			return;
 		}
 		else if (addr >= 0x8000 && addr < 0xA000)
@@ -1135,6 +1242,8 @@ public sealed class Cpu
 		{
 			return _sram[(address & 0x0FFF) + (_sramBankOffset << 12)];
 		}
+		else if (address >= 0x8000 && address < 0xA000)
+			return _vramBankOffset == 0 ? Memory[address] : VRamUpper[address & 0x1FFF];
 		else if(address >> 14 == 0b01)
 			return _rom[_romBankOneOffset + address];
 
@@ -1153,6 +1262,8 @@ public sealed class Cpu
 			return ref _sram[address & 0x0FFF];
 		else if (address >= 0xD000 && address < 0xE000)
 			return ref _sram[(address & 0x0FFF) + (_sramBankOffset << 12)];
+		else if (address >= 0x8000 && address < 0xA000)
+			return ref (_vramBankOffset == 0 ? ref Memory[address] : ref VRamUpper[address & 0x1FFF]);
 		else
 			return ref Memory[address];
 	}

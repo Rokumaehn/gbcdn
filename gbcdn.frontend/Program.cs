@@ -46,7 +46,7 @@ internal static class Program
             144
         );
 
-        var romFilename = args.Length > 0 ? args[0] : Path.GetFullPath("../../../../silver.gbc");
+        var romFilename = args.Length > 0 ? args[0] : Path.GetFullPath("../../../../crystal.gbc");
 		var rom = File.ReadAllBytes(romFilename);
 
 		var cpu = new Cpu(rom, romFilename);

@@ -5,10 +5,15 @@ public sealed class Rtc
 	private readonly Cpu _cpu;
 
     bool carry = false;
+    bool carryLatched = false;
     int day = 0;
+    int dayLatched = 0;
     byte hour = 0;
+    byte hourLatched = 0;
     byte minute = 0;
+    byte minuteLatched = 0;
     byte second = 0;
+    byte secondLatched = 0;
     DateTime refTime = DateTime.Now;
 
 	public Rtc(Cpu cpu)
@@ -16,6 +21,7 @@ public sealed class Rtc
 		_cpu = cpu;
 		_cpu.OnRtcWrite = WriteRegister;
 		_cpu.OnRtcRead = ReadRegister;
+        _cpu.OnRtcLatchWrite = LatchWrite; 
         _cpu.OnLoad += Load;
         _cpu.OnSave += Save;
 	}
@@ -58,6 +64,12 @@ public sealed class Rtc
 
 	private void WriteRegister(byte reg, byte val)
     {
+        if (_isLatched)
+        {
+            Console.WriteLine("write to RTC while it is latched... doc says, write to hw regs, not to latch, sneaky.");
+            return;
+        }
+
         switch (reg)
         {
             case 0x08:
@@ -70,7 +82,7 @@ public sealed class Rtc
                 hour = val;
                 break;
             case 0x0B:
-                day = val;
+                day = val | (day & 0x100);
                 break;
             case 0x0C:
                 if((val & 0x01) != 0)
@@ -85,7 +97,7 @@ public sealed class Rtc
         refTime = DateTime.Now;
     }
 
-    private byte ReadRegister(byte reg)
+    private void AdvanceTime()
     {
         var sample = DateTime.Now;
         TimeSpan elapsed = sample - refTime;
@@ -118,22 +130,69 @@ public sealed class Rtc
                 carry = true;
             }
         }
+    }
 
+    private byte ReadRegister(byte reg)
+    {
+        if (!_isLatched) // this basically freezes the RTC when latched
+        {
+            AdvanceTime();
+
+            switch (reg)
+            {
+                case 0x08:
+                    return second;
+                case 0x09:
+                    return minute;
+                case 0x0A:
+                    return hour;
+                case 0x0B:
+                    return (byte)day;
+                case 0x0C:
+                    return (byte)((carry ? 0x80 : 0x00) | ((day & 0x100) >> 8));
+                default:
+                    return 0;
+            }
+        }
+
+        // If latched, return the latched values
         switch (reg)
         {
             case 0x08:
-                return second;
+                return secondLatched;
             case 0x09:
-                return minute;
+                return minuteLatched;
             case 0x0A:
-                return hour;
+                return hourLatched;
             case 0x0B:
-                return (byte)day;
+                return (byte)dayLatched;
             case 0x0C:
-                return (byte)((carry ? 0x80 : 0x00) | ((day & 0x100) >> 8));
+                return (byte)((carryLatched ? 0x80 : 0x00) | ((dayLatched & 0x100) >> 8));
             default:
                 return 0;
         }
     }
+
+    private bool _isLatched;
+    private byte _lastLatchWrite;
+	private void LatchWrite(int addr, byte value)
+	{
+		// Implement RTC latch write handling here
+        if (value == 0x01 && _lastLatchWrite == 0x00)
+        {
+            AdvanceTime();
+            _isLatched = !_isLatched;
+            Console.WriteLine("RTC registers " + (_isLatched ? "latched" : "unlatched"));
+            if (_isLatched)
+            {
+                secondLatched = second;
+                minuteLatched = minute;
+                hourLatched = hour;
+                dayLatched = day;
+                carryLatched = carry;
+            }
+        }
+        _lastLatchWrite = value;
+	}
 
 }
