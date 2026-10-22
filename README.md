@@ -20,15 +20,15 @@ them to an SDL3 window and audio device and paces emulation to ~59.7 frames per 
   Output is 44.1 kHz, 16-bit stereo in a thread-safe ring buffer.
 - **Audio playback** — SDL3 stream with dynamic rate control (the emulator and audio
   device clocks stay locked without dropped/duplicated samples).
-- **Input** — keyboard and (on Windows) Xbox controller.
+- **Input** — keyboard and gamepad via SDL3.
 - **Diagnostics** — a sampled per-component timing report is written on clean exit.
 
 ## Requirements
 
 - [.NET 10 SDK](https://dotnet.microsoft.com/)
-- **Windows** for the included frontend: it references `SDL3-CS.Windows` and uses XInput
-  behind `#if WINDOWS`. The core library itself is platform-agnostic; another OS needs
-  the matching `SDL3-CS` native package and removal of the XInput block.
+- **Windows** for the included frontend: it references `SDL3-CS.Windows`. The core 
+  library itself is platform-agnostic; another OS needs the matching `SDL3-CS` 
+  native package.
 - A legally obtained Game Boy / Game Boy Color ROM. ROMs and save files are not
   included in this repository and are gitignored.
 
@@ -56,7 +56,7 @@ working directory and is only meant as a development convenience.
 | A | `A` | A |
 | B | `S` | B |
 | Start | `Enter` | Start |
-| Select | `Space` | — |
+| Select | `Space` | Back |
 | Quit | `Esc` | — |
 
 ## Save data & diagnostics

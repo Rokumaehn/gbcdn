@@ -76,6 +76,7 @@ public sealed class Rtc
 
 	private void WriteRegister(byte reg, byte val)
     {
+        Console.WriteLine($"RtcWriteRegister: reg={reg:X2}, val={val:X2}");
         if(!halt)
             AdvanceTime();
         
@@ -159,36 +160,38 @@ public sealed class Rtc
     private void AdvanceTime()
     {
         var sample = DateTime.Now;
-        TimeSpan elapsed = sample - refTime;
-        if(elapsed.Seconds!=0 || elapsed.Minutes!=0 || elapsed.Hours!=0 || elapsed.Days!=0)
+        var elapsed = sample - refTime;
+        if (elapsed <= TimeSpan.Zero)
         {
-            second += (byte)elapsed.Seconds;
-            minute += (byte)elapsed.Minutes;
-            hour += (byte)elapsed.Hours;
-            day += (int)elapsed.Days;
-            refTime = sample - new TimeSpan(0, 0, 0, 0, elapsed.Milliseconds, elapsed.Microseconds);
-
-            if (second >= 60)
-            {
-                second -= 60;
-                minute++;
-            }
-            if (minute >= 60)
-            {
-                minute -= 60;
-                hour++;
-            }
-            if (hour >= 24)
-            {
-                hour -= 24;
-                day++;
-            }
-            if (day >= 512) // 9-bit day overflow
-            {
-                day &= 0x1FF;
-                carry = true;
-            }
+            // A real RTC only counts forward; ignore host clock corrections that
+            // would move it backwards (and avoid corrupting the fields with
+            // negative time components).
+            refTime = sample;
+            return;
         }
+
+        var seconds = elapsed.Ticks / TimeSpan.TicksPerSecond;
+        if (seconds == 0)
+            return; // keep the sub-second remainder for the next call
+
+        refTime = refTime.AddTicks(seconds * TimeSpan.TicksPerSecond);
+
+        long total = second + seconds;
+        second = (byte)(total % 60);
+        total /= 60;
+        total += minute;
+        minute = (byte)(total % 60);
+        total /= 60;
+        total += hour;
+        hour = (byte)(total % 24);
+        total /= 24;
+        total += day;
+        if (total > 0x1FF)
+        {
+            total &= 0x1FF;
+            carry = true;
+        }
+        day = (int)total;
     }
 
 }

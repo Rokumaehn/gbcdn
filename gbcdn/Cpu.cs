@@ -29,8 +29,8 @@ public sealed class Cpu
 	private bool _ramEnabled;
 	private int _ramBankOffset;
 	private byte _ramBankSel;
-	public readonly byte[] _sram = new byte[0x8000];
-	public int _sramBankOffset = 1;
+	public readonly byte[] _wram = new byte[0x8000];
+	public int _wramBankOffset = 1;
 	private int _vramBankOffset = 0;
 	private int _hdmaSource;
 	private int _hdmaDest;
@@ -49,9 +49,9 @@ public sealed class Cpu
 	private bool IME; // Interrupt Master Enable
 	private bool FlagZ = true; // Zero Flag
 	private bool FlagN; // Subtract Flag
-	private bool FlagH = true; // Half Carry Flag
-	private bool FlagC = true; // Carry Flag
-	private byte A = 0x11, B, C = 0x13, D, E = 0xD8, H = 0x01, L = 0x4D;
+	private bool FlagH; // Half Carry Flag
+	private bool FlagC; // Carry Flag
+	private byte A = 0x11, B, C, D = 0xFF, E = 0x56, H, L = 0x0D;
 	private ushort PC = 0x0100;
 	private ushort SP = 0xFFFE;
 
@@ -135,8 +135,6 @@ public sealed class Cpu
 			default:
 				throw new InvalidOperationException("Unsupported cartridge type");
 		}
-		//if (_rom[0x147] > 0x03) // check cartridge type
-		//	throw new InvalidOperationException("Only supports ROMs without MBC or with MBC1");
 		_romBankOneMask = (byte)((2 << _rom[0x148]) - 1); // determine ROM bank count from ROM size code
 		Array.Copy(rom, Memory, 0x4000); // load first ROM bank at 0x0000-0x3FFF
 
@@ -162,7 +160,7 @@ public sealed class Cpu
 		{
 			var bank = value & 0b111;
 			Memory[0xFF70] = (byte)bank;
-			_sramBankOffset = bank == 0 ? 1 : bank;
+			_wramBankOffset = bank == 0 ? 1 : bank;
 		}; // SVBK
 		OnMemoryWrite[0x4F] = value =>
 		{
@@ -188,15 +186,13 @@ public sealed class Cpu
 
 		_hdmaActive = false;
 		Memory[0xFF55] = 0xFF;
-		
-		if(_cartridgeType is 0x03 or 0x10 or 0x13) // MBC1/3 with battery-backed RAM
-			Load();
 	}
 
 	public void Save()
 	{
 		if((_cartridgeType is 0x03 or 0x10 or 0x13) && _ram.Length > 0 && _pathToRom != null)
 		{
+			FlushCurrentCartridgeRamBank();
 			using (var writer = new BinaryWriter(File.Open(Path.ChangeExtension(_pathToRom, ".ram"), FileMode.OpenOrCreate)))
 			{
 				writer.Write(_ram);
@@ -215,9 +211,25 @@ public sealed class Cpu
 			{
 				reader.Read(_ram, 0, _ram.Length);
 			}
+			LoadRamBankFromCartridgeRam();
 		}
 
 		OnLoad?.Invoke(_pathToRom);
+	}
+
+	private bool HasValidRamBankOffset()
+		=> _ram.Length > 0 && _ramBankOffset >= 0 && _ramBankOffset + 0x2000 <= _ram.Length;
+
+	private void FlushCurrentCartridgeRamBank()
+	{
+		if (HasValidRamBankOffset())
+			Array.Copy(Memory, 0xA000, _ram, _ramBankOffset, 0x2000);
+	}
+
+	private void LoadRamBankFromCartridgeRam()
+	{
+		if (HasValidRamBankOffset())
+			Array.Copy(_ram, _ramBankOffset, Memory, 0xA000, 0x2000);
 	}
 
 	[MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -315,9 +327,9 @@ public sealed class Cpu
 		if (address < 0xC000)
 			return Memory[address];
 		if (address < 0xD000)
-			return _sram[address & 0x0FFF];
+			return _wram[address & 0x0FFF];
 		if (address < 0xE000)
-			return _sram[(address & 0x0FFF) + (_sramBankOffset << 12)];
+			return _wram[(address & 0x0FFF) + (_wramBankOffset << 12)];
 		return Memory[address];
 	}
 
@@ -1185,12 +1197,12 @@ public sealed class Cpu
 		}
 		else if (addr >= 0xC000 && addr < 0xD000)
 		{
-			_sram[addr & 0x0FFF] = value;
+			_wram[addr & 0x0FFF] = value;
 			return;
 		}
 		else if (addr >= 0xD000 && addr < 0xE000)
 		{
-			_sram[(addr & 0x0FFF) + (_sramBankOffset << 12)] = value;
+			_wram[(addr & 0x0FFF) + (_wramBankOffset << 12)] = value;
 			return;
 		}
 
@@ -1239,11 +1251,11 @@ public sealed class Cpu
 		}
 		else if (address >= 0xC000 && address < 0xD000)
 		{
-			return _sram[address & 0x0FFF];
+			return _wram[address & 0x0FFF];
 		}
 		else if (address >= 0xD000 && address < 0xE000)
 		{
-			return _sram[(address & 0x0FFF) + (_sramBankOffset << 12)];
+			return _wram[(address & 0x0FFF) + (_wramBankOffset << 12)];
 		}
 		else if (address >= 0x8000 && address < 0xA000)
 			return _vramBankOffset == 0 ? Memory[address] : VRamUpper[address & 0x1FFF];
@@ -1262,9 +1274,9 @@ public sealed class Cpu
 		if(address >> 14 == 0b01)
 			return ref _rom[_romBankOneOffset + address];
 		else if (address >= 0xC000 && address < 0xD000)
-			return ref _sram[address & 0x0FFF];
+			return ref _wram[address & 0x0FFF];
 		else if (address >= 0xD000 && address < 0xE000)
-			return ref _sram[(address & 0x0FFF) + (_sramBankOffset << 12)];
+			return ref _wram[(address & 0x0FFF) + (_wramBankOffset << 12)];
 		else if (address >= 0x8000 && address < 0xA000)
 			return ref (_vramBankOffset == 0 ? ref Memory[address] : ref VRamUpper[address & 0x1FFF]);
 		else
