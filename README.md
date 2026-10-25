@@ -1,4 +1,4 @@
-# gbcdn
+# GbcDN
 
 A Game Boy Color emulator written in C# (.NET 10), with a small SDL3 frontend.
 
@@ -36,17 +36,17 @@ them to an SDL3 window and audio device and paces emulation to ~59.7 frames per 
 
 ```powershell
 dotnet build gbcdn.slnx -c Release
-dotnet run --project gbcdn.frontend -c Release -- "C:\path\to\game.gbc"
+dotnet run --project gbcdn.frontend -c Release
 ```
 
 Or run the built executable directly:
 
 ```powershell
-.\gbcdn.frontend\bin\Release\net10.0\gbcdn.frontend.exe "C:\path\to\game.gbc"
+.\gbcdn.frontend\bin\Release\net10.0\gbcdn.frontend.exe
 ```
 
-Pass the ROM path explicitly; the fallback path in the frontend assumes a specific
-working directory and is only meant as a development convenience.
+ROM Path can be passed as the first argument on the command line.
+If no ROM Path is specified, the ROM can be selected via the GUI.
 
 ## Controls
 
@@ -57,7 +57,7 @@ working directory and is only meant as a development convenience.
 | B | `S` | B |
 | Start | `Enter` | Start |
 | Select | `Space` | Back |
-| Quit | `Esc` | — |
+| Menu | `Esc` | — |
 
 ## Save data & diagnostics
 
@@ -85,6 +85,7 @@ gbcdn/
   Rtc.cs          MBC3 real-time clock
 gbcdn.frontend/
   Program.cs      SDL3 window, rendering, audio output, input, frame pacing
+  Gui.cs          GUI implemented with ImGui.net
 ```
 
 ## Status & limitations
@@ -99,6 +100,12 @@ gbcdn.frontend/
 See [Pan Docs](https://gbdev.io/pandocs/) for the hardware documentation this
 emulator follows.
 
+## Background
+This project was based on [dnmg](https://github.com/twobrainsgmbh/dnmg), an emulator for the original GameBoy.
+A big thanks to the original Authors.
+
 ## License
 
-MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Rokumaehn.
+MIT — see [LICENSE](LICENSE).  
+Copyright (c) 2026 Christian Dix  
+Copyright (c) 2026 twobrains GmbH (for the classic GB code)  

@@ -28,6 +28,24 @@ public sealed class Rtc
         _cpu.OnSave += Save;
 	}
 
+    public async Task SaveState(string? pathToRom)
+    {
+        if(!_cpu._hasRtc)
+            return;
+        if (pathToRom == null)
+			return;
+		var payload = $"{refTime.Ticks} {day} {hour} {minute} {second} {carry} {halt}";
+		await Task.Run(() => { DumpToFile(Path.ChangeExtension(pathToRom, ".rtc"), payload); });
+    }
+
+    private void DumpToFile(string path, string data)
+	{
+		using (StreamWriter writer = new StreamWriter(path))
+        {
+            writer.WriteLine(data);
+        }
+	}
+
     private void Save(string? pathToRom)
     {
         if (pathToRom == null || !_cpu._hasRtc)

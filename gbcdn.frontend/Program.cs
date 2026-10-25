@@ -14,6 +14,9 @@ internal static class Program
 	static bool _measureFrame;
 	static int _frameCounter;
 
+    static Gamepad _gamepad = new Gamepad();
+
+
     [STAThread]
     private static void Main(string[] args)
     {
@@ -23,29 +26,61 @@ internal static class Program
             return;
         }
 
-        if (!SDL.CreateWindowAndRenderer("gbcdn 1.0", 800, 600, 0, out var window, out var renderer))
+        if (!SDL.CreateWindowAndRenderer("GbcDN", 800, 600, 0, out var window, out var renderer))
         {
             SDL.LogError(SDL.LogCategory.Application, $"Error creating window and renderer: {SDL.GetError()}");
             return;
         }
 
-        SDL.SetRenderDrawColor(renderer, 100, 149, 237, 255);
-        SDL.RenderClear(renderer);
-        SDL.RenderPresent(renderer);
+        //SDL.SetRenderDrawColor(renderer, 100, 149, 237, 255);
+        //SDL.RenderClear(renderer);
+        //SDL.RenderPresent(renderer);
+
+		Gui gui = new Gui(renderer, 800, 600, _gamepad);
 
         // Create the virtual framebuffer texture
         nint framebufferTexture = SDL.CreateTexture(
             renderer, 
-            SDL.PixelFormat.RGB565, // Choose a standard 16-bit pixel format
+            SDL.PixelFormat.RGB565,
             SDL.TextureAccess.Streaming, 
             160, 
             144
         );
 
-		IntPtr activeGamepad = IntPtr.Zero;
-        uint activeGamepadId = 0;
+		var audioSpec = new SDL.AudioSpec
+		{
+			Channels = 2,
+			Format = SDL.AudioFormat.AudioS16LE,
+			Freq = 44100
+		};
 
-        var romFilename = args.Length > 0 ? args[0] : Path.GetFullPath("../../../../demo3.gbc");
+		var audioStream = SDL.OpenAudioDeviceStream(SDL.AudioDeviceDefaultPlayback, in audioSpec, null, IntPtr.Zero);
+		if (audioStream == IntPtr.Zero)
+		{
+			SDL.LogError(SDL.LogCategory.Application, $"Couldn't open audio stream: {SDL.GetError()}");
+		}
+		else
+		{
+			PrimeAudioStream(audioStream, 44100);
+			SDL.ResumeAudioStreamDevice(audioStream);
+		}
+
+		var romFilename = args.Length > 0 ? args[0] : null;
+		if (romFilename == null)
+		{
+			romFilename = gui.GuiPickFile(false);
+			if (romFilename == null || gui.IsRunning == false)
+			{
+				if (audioStream != IntPtr.Zero)
+					SDL.DestroyAudioStream(audioStream);
+				gui?.Dispose();
+				SDL.DestroyRenderer(renderer);
+				SDL.DestroyWindow(window);
+				SDL.Quit();
+				return;
+			}
+		}
+
 		var rom = File.ReadAllBytes(romFilename);
 
 		var cpu = new Cpu(rom, romFilename);
@@ -56,183 +91,49 @@ internal static class Program
 		var rtc = new Rtc(cpu);
 		cpu.Load();
 
-		var audioSpec = new SDL.AudioSpec
-		{
-			Channels = 2,
-			Format = SDL.AudioFormat.AudioS16LE,
-			Freq = apu.SampleRate
-		};
-
-		var audioStream = SDL.OpenAudioDeviceStream(SDL.AudioDeviceDefaultPlayback, in audioSpec, null, IntPtr.Zero);
-		if (audioStream == IntPtr.Zero)
-		{
-			SDL.LogError(SDL.LogCategory.Application, $"Couldn't open audio stream: {SDL.GetError()}");
-		}
-		else
-		{
-			PrimeAudioStream(audioStream, apu.SampleRate);
-			SDL.ResumeAudioStreamDevice(audioStream);
-		}
-
 		var totalCycles = 0;
 		var  frameDuration = TimeSpan.FromSeconds(70_224.0 / 4_194_304.0);
 		long nextFrameTimestamp = Stopwatch.GetTimestamp();
-
-		bool running = true;
-    	//SDL.Event e;
-
-		//bool frameReady = false;
-
-		// Task.Run(async () =>
-		// {
-		// 	while(true)
-		// 	{
-		// 		await Task.Delay(2);
-		// 		if (!frameReady)
-		// 			continue;
-		// 		frameReady = false;
-		// 		PrintFrameBufferOnTexture(framebufferTexture, ppu, 2);
-		// 		// Clear the current frame
-		// 		SDL.RenderClear(renderer);
-		// 		// Copy your virtual framebuffer texture to the entire screen
-		// 		SDL.RenderTexture(renderer, framebufferTexture, IntPtr.Zero, IntPtr.Zero);
-		// 		// Present the updated backbuffer
-		// 		SDL.RenderPresent(renderer);
-		// 	}
-		// });
 		
+		Task? taskSaveCart = null;
+		Task? taskSaveRtc = null;
+		var autosaveTimestamp = DateTime.Now;
 		int eventPumpCounter = 0;
+		bool running = true;
+		bool escapePressed = false;
+
         while (running)
 		{
 			eventPumpCounter++;
-
 			if(eventPumpCounter % 1000 == 0)
-			while (SDL.PollEvent(out var e))
+				running = EventLoop(input, out escapePressed);
+			if (!running)
+				break;
+
+			if (escapePressed)
 			{
-				switch (e.Type)
+				escapePressed = false;
+				var newRomFilename = gui.GuiPickFile();
+				nextFrameTimestamp = Stopwatch.GetTimestamp();
+				if(gui.IsRunning == false)
 				{
-					case (uint)SDL.EventType.Quit:
-						running = false;
-						break;
-					case (uint)SDL.EventType.KeyDown:
-						{
-							// Beenden mit der ESC-Taste
-							if (e.Key.Scancode == SDL.Scancode.Escape)
-							{
-								running = false;
-							}
-							if (e.Key.Scancode switch
-							{
-								SDL.Scancode.Right => Input.JoypadButtons.RightArrow,
-								SDL.Scancode.Left => Input.JoypadButtons.LeftArrow,
-								SDL.Scancode.Up => Input.JoypadButtons.UpArrow,
-								SDL.Scancode.Down => Input.JoypadButtons.DownArrow,
-								SDL.Scancode.A => Input.JoypadButtons.A,
-								SDL.Scancode.S => Input.JoypadButtons.B,
-								SDL.Scancode.Return => Input.JoypadButtons.Start,
-								SDL.Scancode.Space => Input.JoypadButtons.Select,
-								_ => default(Input.JoypadButtons?)
-							} is { } key)
-							{
-								input.PressedButtons |= key;
-							}
-						}
-						break;
-					case (uint)SDL.EventType.KeyUp:
-						{
-							if (e.Key.Scancode switch
-							{
-								SDL.Scancode.Right => Input.JoypadButtons.RightArrow,
-								SDL.Scancode.Left => Input.JoypadButtons.LeftArrow,
-								SDL.Scancode.Up => Input.JoypadButtons.UpArrow,
-								SDL.Scancode.Down => Input.JoypadButtons.DownArrow,
-								SDL.Scancode.A => Input.JoypadButtons.A,
-								SDL.Scancode.S => Input.JoypadButtons.B,
-								SDL.Scancode.Return => Input.JoypadButtons.Start,
-								SDL.Scancode.Space => Input.JoypadButtons.Select,
-								_ => default(Input.JoypadButtons?)
-							} is { } key)
-							{
-								input.PressedButtons &= ~key;
-							}
-						}
-						break;
-					
-					// Hotplugging: A controller was connected
-                    case (uint)SDL.EventType.GamepadAdded:
-						Console.WriteLine($"gamepad added.");
-                        // e.GDevice.Which holds the device instance index for initialization
-                        if (activeGamepad == IntPtr.Zero)
-                        {
-                            activeGamepad = SDL.OpenGamepad(e.GDevice.Which);
-                            if (activeGamepad != IntPtr.Zero)
-                            {
-                                activeGamepadId = e.GDevice.Which;
-                                string? name = SDL.GetGamepadName(activeGamepad);
-                                Console.WriteLine($"[CONNECTED] {name} (ID: {activeGamepadId})");
-                            }
-                        }
-                        break;
+					running = false;
+					break;
+				}
+				if (newRomFilename != null)
+				{
+					cpu.Save();
+					ppu.Dispose();
 
-                    // Hotplugging: A controller was disconnected
-                    case (uint)SDL.EventType.GamepadRemoved:
-                        if (activeGamepad != IntPtr.Zero && e.GDevice.Which == activeGamepadId)
-                        {
-                            Console.WriteLine($"[DISCONNECTED] Gamepad ID: {activeGamepadId}");
-                            SDL.CloseGamepad(activeGamepad);
-                            activeGamepad = IntPtr.Zero;
-                            activeGamepadId = 0;
-                        }
-                        break;
-
-					// Button Pressed
-                    case (uint)SDL.EventType.GamepadButtonDown:
-						{
-							// Cast the byte to the corresponding strongly typed SDL_GamepadButton enum
-							var pressedButton = (SDL.GamepadButton)e.GButton.Button;
-							Console.WriteLine($"[BUTTON DOWN] Button: {pressedButton}");
-							
-							if (pressedButton switch
-							{
-								SDL.GamepadButton.DPadRight => Input.JoypadButtons.RightArrow,
-								SDL.GamepadButton.DPadLeft => Input.JoypadButtons.LeftArrow,
-								SDL.GamepadButton.DPadUp => Input.JoypadButtons.UpArrow,
-								SDL.GamepadButton.DPadDown => Input.JoypadButtons.DownArrow,
-								SDL.GamepadButton.East => Input.JoypadButtons.A,
-								SDL.GamepadButton.South => Input.JoypadButtons.B,
-								SDL.GamepadButton.Start => Input.JoypadButtons.Start,
-								SDL.GamepadButton.Back => Input.JoypadButtons.Select,
-								_ => default(Input.JoypadButtons?)
-							} is { } key)
-							{
-								input.PressedButtons |= key;
-							}
-						}
-                        break;
-
-                    // Button Released
-                    case (uint)SDL.EventType.GamepadButtonUp:
-						{
-							var releasedButton = (SDL.GamepadButton)e.GButton.Button;
-							Console.WriteLine($"[BUTTON UP] Button: {releasedButton}");
-
-							if (releasedButton switch
-							{
-								SDL.GamepadButton.DPadRight => Input.JoypadButtons.RightArrow,
-								SDL.GamepadButton.DPadLeft => Input.JoypadButtons.LeftArrow,
-								SDL.GamepadButton.DPadUp => Input.JoypadButtons.UpArrow,
-								SDL.GamepadButton.DPadDown => Input.JoypadButtons.DownArrow,
-								SDL.GamepadButton.East => Input.JoypadButtons.A,
-								SDL.GamepadButton.South => Input.JoypadButtons.B,
-								SDL.GamepadButton.Start => Input.JoypadButtons.Start,
-								SDL.GamepadButton.Back => Input.JoypadButtons.Select,
-								_ => default(Input.JoypadButtons?)
-							} is { } key)
-							{
-								input.PressedButtons &= ~key;
-							}
-						}
-                        break;
+					romFilename = newRomFilename;
+					rom = File.ReadAllBytes(romFilename);
+					cpu = new Cpu(rom, romFilename);
+					ppu = new Ppu(cpu);
+					timer = new Timer(cpu);
+					input = new Input(cpu);
+					apu = new Apu(cpu, 44100);
+					rtc = new Rtc(cpu);
+					cpu.Load();
 				}
 			}
 
@@ -292,7 +193,9 @@ internal static class Program
 					long currentTimestamp = Stopwatch.GetTimestamp();
 					long remainingTicks = nextFrameTimestamp - currentTimestamp;
 					if (remainingTicks <= 0)
+					{
 						break;
+					}
 					
 					double remainingMs = remainingTicks * 1000.0 / Stopwatch.Frequency;
 					if (remainingMs > 2.0)
@@ -307,9 +210,30 @@ internal static class Program
 					}
 				}
 				// --- end of frame throttling ---
+
+				// Autosave cartridge RAM and RTC state every minute
+				var sampleTime = DateTime.Now;
+				var sampleTimeDelta = sampleTime - autosaveTimestamp;
+				if (sampleTimeDelta.TotalMinutes >= 1)
+				{
+					autosaveTimestamp = sampleTime;
+
+					if (taskSaveCart != null && taskSaveCart.IsCompleted)
+						taskSaveCart = null;
+					if (taskSaveCart == null)  // if this evaluates to false, it means you are writing to punchcard...
+						taskSaveCart = cpu.SaveCartridgeRam(romFilename);
+					if (taskSaveRtc != null && taskSaveRtc.IsCompleted)
+						taskSaveRtc = null;
+					if (taskSaveRtc == null)
+						taskSaveRtc = rtc.SaveState(romFilename);
+				}
 			}
 		}
 
+		if (taskSaveCart != null && !taskSaveCart.IsCompleted)
+			taskSaveCart.Wait();
+		if (taskSaveRtc != null && !taskSaveRtc.IsCompleted)
+			taskSaveRtc.Wait();
 		cpu.Save();
 
 		ppu.Dispose();
@@ -343,11 +267,155 @@ internal static class Program
         if (audioStream != IntPtr.Zero)
             SDL.DestroyAudioStream(audioStream);
 
+		gui?.Save();
+		gui?.Dispose();
         SDL.DestroyRenderer(renderer);
         SDL.DestroyWindow(window);
         SDL.Quit();
 
     }
+
+	static bool _prevEscapePressed;
+	private static bool EventLoop(Input input, out bool escapePressed)
+	{
+		escapePressed = false;
+		
+		while (SDL.PollEvent(out var e))
+		{
+			switch (e.Type)
+			{
+				case (uint)SDL.EventType.Quit:
+					return false;
+
+				case (uint)SDL.EventType.KeyDown:
+					{
+						if (e.Key.Scancode == SDL.Scancode.Escape)
+						{
+							if (!_prevEscapePressed)
+							{
+								escapePressed = true;
+								_prevEscapePressed = true;
+							}
+						}
+						if (e.Key.Scancode switch
+						{
+							SDL.Scancode.Right => Input.JoypadButtons.RightArrow,
+							SDL.Scancode.Left => Input.JoypadButtons.LeftArrow,
+							SDL.Scancode.Up => Input.JoypadButtons.UpArrow,
+							SDL.Scancode.Down => Input.JoypadButtons.DownArrow,
+							SDL.Scancode.A => Input.JoypadButtons.A,
+							SDL.Scancode.S => Input.JoypadButtons.B,
+							SDL.Scancode.Return => Input.JoypadButtons.Start,
+							SDL.Scancode.Space => Input.JoypadButtons.Select,
+							_ => default(Input.JoypadButtons?)
+						} is { } key)
+						{
+							input.PressedButtons |= key;
+						}
+					}
+					break;
+				case (uint)SDL.EventType.KeyUp:
+					{
+						if (e.Key.Scancode == SDL.Scancode.Escape)
+						{
+							escapePressed = false;
+							_prevEscapePressed = false;
+						}
+						if (e.Key.Scancode switch
+						{
+							SDL.Scancode.Right => Input.JoypadButtons.RightArrow,
+							SDL.Scancode.Left => Input.JoypadButtons.LeftArrow,
+							SDL.Scancode.Up => Input.JoypadButtons.UpArrow,
+							SDL.Scancode.Down => Input.JoypadButtons.DownArrow,
+							SDL.Scancode.A => Input.JoypadButtons.A,
+							SDL.Scancode.S => Input.JoypadButtons.B,
+							SDL.Scancode.Return => Input.JoypadButtons.Start,
+							SDL.Scancode.Space => Input.JoypadButtons.Select,
+							_ => default(Input.JoypadButtons?)
+						} is { } key)
+						{
+							input.PressedButtons &= ~key;
+						}
+					}
+					break;
+				
+				// Hotplugging: A controller was connected
+				case (uint)SDL.EventType.GamepadAdded:
+					// e.GDevice.Which holds the device instance index for initialization
+					if (_gamepad.ActiveGamepad == IntPtr.Zero)
+					{
+						_gamepad.ActiveGamepad = SDL.OpenGamepad(e.GDevice.Which);
+						if (_gamepad.ActiveGamepad != IntPtr.Zero)
+						{
+							_gamepad.ActiveGamepadId = e.GDevice.Which;
+							string? name = SDL.GetGamepadName(_gamepad.ActiveGamepad);
+							Console.WriteLine($"[CONNECTED] {name} (ID: {_gamepad.ActiveGamepadId})");
+						}
+					}
+					break;
+
+				// Hotplugging: A controller was disconnected
+				case (uint)SDL.EventType.GamepadRemoved:
+					if (_gamepad.ActiveGamepad != IntPtr.Zero && e.GDevice.Which == _gamepad.ActiveGamepadId)
+					{
+						Console.WriteLine($"[DISCONNECTED] Gamepad ID: {_gamepad.ActiveGamepadId}");
+						SDL.CloseGamepad(_gamepad.ActiveGamepad);
+						_gamepad.ActiveGamepad = IntPtr.Zero;
+						_gamepad.ActiveGamepadId = 0;
+					}
+					break;
+
+				// Button Pressed
+				case (uint)SDL.EventType.GamepadButtonDown:
+					{
+						// Cast the byte to the corresponding strongly typed SDL_GamepadButton enum
+						var pressedButton = (SDL.GamepadButton)e.GButton.Button;
+						
+						if (pressedButton switch
+						{
+							SDL.GamepadButton.DPadRight => Input.JoypadButtons.RightArrow,
+							SDL.GamepadButton.DPadLeft => Input.JoypadButtons.LeftArrow,
+							SDL.GamepadButton.DPadUp => Input.JoypadButtons.UpArrow,
+							SDL.GamepadButton.DPadDown => Input.JoypadButtons.DownArrow,
+							SDL.GamepadButton.East => Input.JoypadButtons.A,
+							SDL.GamepadButton.South => Input.JoypadButtons.B,
+							SDL.GamepadButton.Start => Input.JoypadButtons.Start,
+							SDL.GamepadButton.Back => Input.JoypadButtons.Select,
+							_ => default(Input.JoypadButtons?)
+						} is { } key)
+						{
+							input.PressedButtons |= key;
+						}
+					}
+					break;
+
+				// Button Released
+				case (uint)SDL.EventType.GamepadButtonUp:
+					{
+						var releasedButton = (SDL.GamepadButton)e.GButton.Button;
+
+						if (releasedButton switch
+						{
+							SDL.GamepadButton.DPadRight => Input.JoypadButtons.RightArrow,
+							SDL.GamepadButton.DPadLeft => Input.JoypadButtons.LeftArrow,
+							SDL.GamepadButton.DPadUp => Input.JoypadButtons.UpArrow,
+							SDL.GamepadButton.DPadDown => Input.JoypadButtons.DownArrow,
+							SDL.GamepadButton.East => Input.JoypadButtons.A,
+							SDL.GamepadButton.South => Input.JoypadButtons.B,
+							SDL.GamepadButton.Start => Input.JoypadButtons.Start,
+							SDL.GamepadButton.Back => Input.JoypadButtons.Select,
+							_ => default(Input.JoypadButtons?)
+						} is { } key)
+						{
+							input.PressedButtons &= ~key;
+						}
+					}
+					break;
+			}
+		}
+
+		return true;
+	}
 
     private static int AudioTargetBytes(int sampleRate)
         => sampleRate * 2 * sizeof(short) / 30; // ~33 ms of S16 stereo
@@ -414,4 +482,5 @@ internal static class Program
             SDL.UnlockTexture(framebufferTexture);
         }
 	}
+
 }

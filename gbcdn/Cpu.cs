@@ -188,15 +188,40 @@ public sealed class Cpu
 		Memory[0xFF55] = 0xFF;
 	}
 
+	public byte[]? SerializeCartridgeRam()
+	{
+		if((_cartridgeType is 0x03 or 0x10 or 0x13) && _ram.Length > 0 && _pathToRom != null)
+		{
+			FlushCurrentCartridgeRamBank();
+			return _ram.Clone() as byte[];
+		}
+		return null;
+	}
+
+	public async Task SaveCartridgeRam(string? pathToRom)
+	{
+		if (pathToRom == null)
+			return;
+		var payload = SerializeCartridgeRam();
+		if (payload == null)
+			return;
+		await Task.Run(() => { DumpToFile(Path.ChangeExtension(pathToRom, ".ram"), payload); });
+	}
+
+	private void DumpToFile(string path, byte[] data)
+	{
+		using (var writer = new BinaryWriter(File.Open(path, FileMode.OpenOrCreate)))
+		{
+			writer.Write(data);
+		}
+	}
+
 	public void Save()
 	{
 		if((_cartridgeType is 0x03 or 0x10 or 0x13) && _ram.Length > 0 && _pathToRom != null)
 		{
 			FlushCurrentCartridgeRamBank();
-			using (var writer = new BinaryWriter(File.Open(Path.ChangeExtension(_pathToRom, ".ram"), FileMode.OpenOrCreate)))
-			{
-				writer.Write(_ram);
-			}
+			DumpToFile(Path.ChangeExtension(_pathToRom, ".ram"), _ram);
 		}
 
 		OnSave?.Invoke(_pathToRom);
